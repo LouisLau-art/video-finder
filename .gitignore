@@ -1,0 +1,36 @@
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated artifacts (large / local only)
+chroma_db/*
+!chroma_db/.gitkeep
+frames/*.jpg
+frames/*.jpeg
+frames/*.png
+frames/manifest.jsonl
+!frames/.gitkeep
+
+# Sample videos (large, local only — 只留说明文档，不提交视频本身)
+videos_sample/*.mp4
+videos_sample/*.mov
+videos_sample/*.mkv
+videos_sample/*.avi
+videos_sample/*.webm
+videos_sample/*.m4v
+videos_sample/*.mpg
+videos_sample/*.mpeg
+!videos_sample/README.md
+
+# Build artifacts
+*.egg-info/
+video_finder_prototype.egg-info/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

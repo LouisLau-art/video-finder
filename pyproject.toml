@@ -1,0 +1,33 @@
+[project]
+name = "video-finder-prototype"
+version = "0.1.0"
+description = "Single-machine CPU prototype: text-to-video-frame search (ffmpeg + SigLIP2/open_clip + Chroma)"
+readme = "README.md"
+requires-python = ">= 3.10"
+license = { text = "MIT" }
+authors = [{ name = "LouisLau-art" }]
+keywords = ["video-search", "siglip2", "open-clip", "chroma", "ffmpeg"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+  "numpy",
+  "pillow",
+  "transformers",
+  "torch",
+  "chromadb",
+  "open-clip-torch",
+  "scenedetect",
+  "opencv-python-headless",
+  "tokenizers",
+  "safetensors",
+]
+
+[tool.uv]
+managed = true
+
+# 本项目只有 scripts/ 脚本，没有可导入的包：阻止 setuptools 把数据目录当包
+[tool.setuptools.packages.find]
+exclude = ["frames*", "chroma_db*", "videos_sample*", "scripts*"]

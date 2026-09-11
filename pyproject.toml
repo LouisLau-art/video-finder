@@ -28,6 +28,9 @@ dependencies = [
 [tool.uv]
 managed = true
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
 # 本项目只有 scripts/ 脚本，没有可导入的包：阻止 setuptools 把数据目录当包
 [tool.setuptools.packages.find]
 exclude = ["frames*", "chroma_db*", "videos_sample*", "scripts*"]

@@ -1,4 +1,4 @@
-# shipin-search · 视频搜索（文本搜视频帧，单机 CPU 原型）
+# video-finder · 视频搜索（文本搜视频帧，单机 CPU 原型）
 
 ![Python 3.14](https://img.shields.io/badge/Python-3.14-blue?logo=python&logoColor=white)
 ![License MIT](https://img.shields.io/badge/License-MIT-green)
@@ -49,7 +49,7 @@ Chroma 本地索引 (chroma_db/, collection=frames, hnsw:space=cosine)
 环境：Arch Linux / Python 3.14（`.python-version` 已锁定）/ `uv` / `ffmpeg + ffprobe`，无 N 卡、无 Docker。
 
 ```bash
-cd shipin-search   # 或 video-finder-prototype（本地旧目录名）
+cd video-finder   # 或 video-finder-prototype（本地旧目录名）
 
 # 1) 建 venv（uv 会按 .python-version 用 python3.14）
 uv venv
@@ -158,7 +158,7 @@ rank score    dist     video_id              time     frame_path
 ## 目录结构
 
 ```text
-shipin-search/
+video-finder/
 ├── videos_sample/      # 把 mp4 放这里（先 10–20 个，不提交，只留 README.md 说明）
 │   └── README.md
 ├── frames/             # 抽出的帧 + manifest.jsonl（.jpg/.manifest 不提交，.gitkeep 占位）

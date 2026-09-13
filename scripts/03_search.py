@@ -39,6 +39,7 @@ ZH2EN: dict[str, str] = {
     "房子": "house",
     "树": "tree",
     "花": "flower",
+    "花苞": "flower bud",
     "水": "water",
     "天空": "sky",
     "夜晚": "night",
@@ -50,7 +51,8 @@ ZH2EN: dict[str, str] = {
 
 def map_query(q: str) -> str:
     out = f" {q} "
-    for zh, en in ZH2EN.items():
+    # 长词优先：避免短词(如"车"/"花")先命中，把长词("汽车"/"花苞")切碎成中英混合垃圾词
+    for zh, en in sorted(ZH2EN.items(), key=lambda kv: len(kv[0]), reverse=True):
         if zh in out:
             # 前后补空格，避免“白色帐篷”粘成 whitetent
             out = out.replace(zh, f" {en} ")

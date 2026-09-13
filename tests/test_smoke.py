@@ -76,6 +76,28 @@ def test_map_query_english_passthrough():
     assert m03.map_query("white tent lawn") == "white tent lawn"
 
 
+def _has_cjk(s: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in s)
+
+
+def test_map_query_huabao_no_cjk_residue():
+    # 回归：花苞不得被切碎成 flower苞，必须完整映射且无 CJK 残留
+    mapped = m03.map_query("花苞")
+    assert not _has_cjk(mapped)
+    assert mapped.split() == ["flower", "bud"]
+
+
+def test_map_query_hua_still_flower():
+    assert m03.map_query("花") == "flower"
+
+
+def test_map_query_long_word_priority():
+    # 长词优先：汽车(表内长词)不得被车(短词)切碎成"汽 car"；颜色+物组合同步验证
+    assert m03.map_query("汽车") == "car"
+    assert not _has_cjk(m03.map_query("汽车"))
+    assert m03.map_query("白色花苞").split() == ["white", "flower", "bud"]
+
+
 # ---------- 02_embed_index.DummyEncoder ----------
 
 def test_build_encoder_dummy_name():

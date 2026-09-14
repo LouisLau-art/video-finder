@@ -22,11 +22,30 @@ import numpy as np
 from PIL import Image
 
 SIGLIP2_ID = "google/siglip2-base-patch16-224"
+CNCLIP_ID = "OFA-Sys/chinese-clip-vit-base-patch16"
 OPENCLIP_MODEL = "ViT-B-32"
 OPENCLIP_PRETRAINED = "laion2b_s34b_b79k"
 
 
 # ---------- encoders ----------
+
+def normalize_features(x):
+    """get_*_features 返回值 → L2 归一化 tensor.
+
+    transformers 5.x 的 get_image_features/get_text_features 可能返回
+    BaseModelOutputWithPooling(CLIP 系: pooler_output 为投影后特征)。
+    """
+    import torch
+    if not isinstance(x, torch.Tensor):
+        for attr in ("image_embeds", "text_embeds", "pooler_output"):
+            v = getattr(x, attr, None)
+            if v is not None:
+                x = v
+                break
+        else:
+            x = x[0]
+    return x / x.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-9)
+
 
 class Siglip2Encoder:
     name = "siglip2"
@@ -44,16 +63,7 @@ class Siglip2Encoder:
 
     @staticmethod
     def _norm(x):
-        import torch
-        if not isinstance(x, torch.Tensor):
-            # transformers 5.x 的 get_*_features 返回 BaseModelOutputWithPooling
-            for attr in ("image_embeds", "text_embeds", "pooler_output"):
-                if hasattr(x, attr):
-                    x = getattr(x, attr)
-                    break
-            else:
-                x = x[0]
-        return x / x.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-9)
+        return normalize_features(x)
 
     def encode_images(self, imgs: list[Image.Image]) -> np.ndarray:
         import torch
@@ -78,6 +88,44 @@ class Siglip2Encoder:
         )
         with torch.no_grad():
             feats = self._norm(self.model.get_text_features(**inputs))
+        return feats.cpu().numpy().astype(np.float32)
+
+
+class CnClipEncoder:
+    """中文原生 CLIP (OFA-Sys/chinese-clip-vit-base-patch16).
+
+    文本直接编码中文, 不需要翻译层; 与 SigLIP2/open_clip 的英文语义空间不通用,
+    查询时必须配对使用同 encoder 建的索引。
+    """
+
+    name = "cnclip"
+    model_id = CNCLIP_ID
+
+    def __init__(self):
+        import torch
+        from transformers import ChineseCLIPModel, ChineseCLIPProcessor
+        self.torch = torch
+        self.processor = ChineseCLIPProcessor.from_pretrained(self.model_id)
+        self.model = ChineseCLIPModel.from_pretrained(self.model_id)
+        self.model.eval()
+        self.dim = int(getattr(self.model.config, "projection_dim", 512) or 512)
+        print(f"[encoder] CN-CLIP loaded: {self.model_id}, dim={self.dim}")
+
+    def encode_images(self, imgs: list[Image.Image]) -> np.ndarray:
+        import torch
+        inputs = self.processor(images=imgs, return_tensors="pt")
+        with torch.no_grad():
+            feats = normalize_features(self.model.get_image_features(**inputs))
+        return feats.cpu().numpy().astype(np.float32)
+
+    def encode_texts(self, texts: list[str]) -> np.ndarray:
+        import torch
+        # 中文原生: 文本直接吃中文(fine-tune 时即中文语料), padding/truncation 常规处理
+        inputs = self.processor(
+            text=texts, return_tensors="pt", padding=True, truncation=True
+        )
+        with torch.no_grad():
+            feats = normalize_features(self.model.get_text_features(**inputs))
         return feats.cpu().numpy().astype(np.float32)
 
 
@@ -155,13 +203,18 @@ class DummyEncoder:
 
 
 def build_encoder(prefer: str | None = None):
-    """prefer: siglip2 | openclip | dummy | None(按顺序自动)."""
+    """prefer: siglip2 | cnclip | openclip | dummy | None(按顺序自动).
+
+    cnclip 只在显式指定时使用(中文原生, 与现有英文索引不通用), 不进自动回退链。
+    """
     order = [prefer] if prefer else ["siglip2", "openclip", "dummy"]
     last_err: Exception | None = None
     for name in order:
         try:
             if name == "siglip2":
                 return Siglip2Encoder()
+            if name == "cnclip":
+                return CnClipEncoder()
             if name == "openclip":
                 return OpenClipEncoder()
             if name == "dummy":
@@ -180,7 +233,7 @@ def main() -> int:
     ap.add_argument("--db", default="chroma_db")
     ap.add_argument("--collection", default="frames")
     ap.add_argument("--batch-size", type=int, default=4, help="CPU 小 batch，默认 4")
-    ap.add_argument("--model", default=None, choices=["siglip2", "openclip", "dummy"],
+    ap.add_argument("--model", default=None, choices=["siglip2", "cnclip", "openclip", "dummy"],
                     help="强制指定 encoder，默认自动: siglip2 -> openclip -> dummy")
     ap.add_argument("--rebuild", action="store_true", help="重建 collection（删掉旧数据）")
     args = ap.parse_args()

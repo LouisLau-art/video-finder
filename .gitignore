@@ -34,3 +34,6 @@ build/
 .DS_Store
 .vscode/
 .idea/
+
+# Local evaluation data (company video names / reports — never publish)
+eval_local/

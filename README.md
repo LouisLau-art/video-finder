@@ -13,10 +13,10 @@
 ## 功能特性
 
 - **文本搜帧**：英文自然描述（如 `white tent lawn black man`）按相似度排序返回帧。
-- **中文查询**：含汉字时优先走本地翻译模型 `Helsinki-NLP/opus-mt-zh-en`（懒加载，CPU）译成英文再编码；模型不可用/翻译失败自动回退内置关键词映射表，无网不断链。
+- **中文查询**：默认中文直查（评测：短中文查询优于翻译，且省 ~4s/查询）；`--translate` 可启用本地翻译模型 `Helsinki-NLP/opus-mt-zh-en`（懒加载，CPU，失败/离线回退关键词映射表）。
 - **场景优先抽帧**：优先 PySceneDetect `ContentDetector` 按场景切分，每场景留 1–3 个中间帧；切不出/报错自动回退纯 1fps，不中断。
 - **黑场/纯色卡过滤**：抽帧后丢弃片头尾黑场、纯色卡帧（灰度均值 < 8 或标准差 < 6），不写 manifest，避免污染检索 top1。
-- **Encoder 三档自动回退**：`SigLIP2（google/siglip2-base-patch16-224）→ open_clip ViT-B/32（laion2b_s34b_b79k）→ dummy 哈希（仅保链路）`，实际用哪个会写进 `chroma_db/encoder.json`，查询时自动对齐，保证图文同一向量空间。
+- **Encoder 组合**：`SigLIP2（google/siglip2-base-patch16-224）→ open_clip ViT-B/32（laion2b_s34b_b79k）→ dummy 哈希（仅保链路）` 自动回退；另可显式 `--model cnclip` 用中文原生 `OFA-Sys/chinese-clip-vit-base-patch16`（评测：中文查询 hit@5 最高、查询延迟最低）。实际用哪个会写进 `chroma_db/encoder.json`，查询时自动对齐，保证图文同一向量空间。
 - **本地持久化**：向量存 `chroma_db/`（cosine 空间），payload 含 `video_id / time / frame_path`，拿着 `frame_path` 直接打开 jpg 就是截图，`video_id + time` 可回跳原视频对应秒数。
 - **CPU 友好**：默认 `--batch-size 4`，小内存可用 `--batch-size 2`。
 
@@ -41,7 +41,7 @@ Chroma 本地索引 (chroma_db/, collection=frames, hnsw:space=cosine)
   + chroma_db/encoder.json (记录实际 encoder)
   │
   ▼
-查询: 文本 → 中文翻译(含汉字时, 离线回退关键词映射) → 同一 encoder 编码 → Chroma query
+查询: 文本 → 中文直查(可选 --translate 翻译, 失败回退关键词映射) → 同一 encoder 编码 → Chroma query
   → 排序输出 rank / score / dist / video_id / time / frame_path
 ```
 
@@ -83,8 +83,8 @@ python scripts/01_extract.py
 # 2) embedding + 建索引（CPU 小 batch，默认 4）
 python scripts/02_embed_index.py
 # 可选参数：--manifest frames/manifest.jsonl --db chroma_db --collection frames
-#           --batch-size 4 --model siglip2|openclip|dummy --rebuild
-#   --batch-size 2 更省内存 / --rebuild 重建索引 / --model 强制指定 encoder
+#           --batch-size 4 --model siglip2|cnclip|openclip|dummy --rebuild
+#   --batch-size 2 更省内存 / --rebuild 重建索引 / --model 强制指定 encoder（cnclip 为中文原生）
 # 输出：chroma_db/（本地持久化）+ chroma_db/encoder.json
 
 # 3) 查
@@ -92,7 +92,8 @@ python scripts/03_search.py "white tent lawn" --topk 20
 python scripts/03_search.py "white tent lawn black man" --topk 20
 python scripts/03_search.py "白色帐篷 草坪" --topk 10
 # 03 可选参数：--db chroma_db --collection frames
-#             --model siglip2|openclip|dummy（默认读 encoder.json自动对齐）
+#             --model siglip2|cnclip|openclip|dummy（默认读 encoder.json自动对齐）
+#             --translate（启用 opus-mt 翻译层，默认直查）
 #             --topk 20（默认 20）
 ```
 
@@ -117,15 +118,17 @@ python scripts/03_search.py "white tent lawn" --topk 20
 python scripts/03_search.py "white tent lawn black man" --topk 20
 ```
 
-中文查询（优先翻译模型，离线回退内置映射）：
+中文查询（默认直查；`--translate` 可选翻译层）：
 
 ```bash
-python scripts/03_search.py "白色帐篷 草坪" --topk 10
-# 终端会打印：[query] 翻译(zh->en): '白色帐篷 草坪' -> 'white tent lawn'
-# 离线/模型不可用时回退：[query] 映射: '白色帐篷 草坪' -> 'white tent lawn'
+python scripts/03_search.py "白色帐篷 草坪" --topk 10              # 直查（默认）
+python scripts/03_search.py "白色帐篷 草坪" --topk 10 --translate  # opus-mt 翻译后再编码
 ```
+- 直查打印：`[query] 映射: '白色帐篷 草坪' -> 'white tent lawn'`（没命中映射词的查询原样直查，如品牌词）
+- `--translate` 打印：`[query] 翻译(zh->en): ...`，失败/离线自动回退 ZH2EN
+- 评测参考（13 视频 × 17 查询，视频级 hit@1/5）：直查 `0.53/0.82` 优于翻译 `0.41/0.71`，故默认关闭翻译；中文原生 encoder `--model cnclip` hit@5 最高（0.88）
 
-翻译不可用时用的兜底映射原理（`scripts/03_search.py` 顶部 `ZH2EN` 表，按长词优先做字符串替换，前后补空格避免粘连）：
+兜底映射原理（`scripts/03_search.py` 顶部 `ZH2EN` 表，按长词优先做字符串替换，前后补空格避免粘连）：
 
 | 中文 | 映射英文 | 中文 | 映射英文 |
 |---|---|---|---|
@@ -169,8 +172,9 @@ video-finder/
 │   └── .gitkeep
 ├── scripts/
 │   ├── 01_extract.py   # ffmpeg 抽帧（优先场景切分，失败回退 1fps）
-│   ├── 02_embed_index.py # embedding + 写 Chroma（SigLIP2 → open_clip → dummy）
-│   └── 03_search.py    # CLI 查询（含中文映射 + encoder 对齐）
+│   ├── 02_embed_index.py # embedding + 写 Chroma（SigLIP2 → open_clip → dummy；cnclip 可选）
+│   ├── 03_search.py    # CLI 查询（中文直查/可选翻译 + encoder 对齐）
+│   └── 04_eval.py      # 评测：多 encoder 视频级 hit@k/MRR 对比（读本地评测集 JSON）
 ├── pyproject.toml
 ├── LICENSE             # MIT
 └── README.md
@@ -181,6 +185,24 @@ video-finder/
 - `01_extract.py`：`video_id = 文件名去后缀`；帧命名 `{video_id}_{ss}.jpg`（ss 保留 1 位小数，如 `demo_2.5.jpg`）；manifest 每行 `video_id/time/frame_path/video_path`；支持视频后缀 `.mp4/.mov/.mkv/.avi/.webm/.m4v/.mpg/.mpeg`。
 - `02_embed_index.py`：Chroma collection 名默认 `frames`，`hnsw:space=cosine`，id 形如 `{video_id}@{time:.1f}`，upsert 写入；结束写 `encoder.json {encoder, model_id, dim}`。
 - `03_search.py`：复用 `02` 的 encoder 实现（`importlib` 动态加载，保证两边一致）；`query` 为必填位置参数。
+- `04_eval.py`：读评测集 JSON（`--queries`，含 `queries[{zh,targets}]`），对配置组合（`siglip2+tr` / `siglip2+zh2en` / `cnclip+raw`）分别建索引→逐查询→输出视频级 hit@1/5/10 + MRR，报告写 `--out`（默认 `eval_local/report.json`）。评测数据含自有素材名，放 `eval_local/`（已 `.gitignore`，不入库）。
+
+## 评测
+
+```bash
+# 本地评测集（不入库；格式见 eval_local/queries.json 示例）
+uv run python scripts/04_eval.py --queries eval_local/queries.json
+# → 汇总表（hit@1/5/10 + MRR）+ 每查询 top1 视频 + eval_local/report.json
+```
+
+- 对比配置：`siglip2+tr`（翻译层）/ `siglip2+zh2en`（直查）/ `cnclip+raw`（中文原生），同帧集分别建索引。
+- 首轮结果（2026-09-14，13 视频 / 342 帧 / 17 条中文查询）：
+  | 配置 | hit@1 | hit@5 | MRR | 查询均耗时 |
+  |---|---|---|---|---|
+  | siglip2+翻译 | 0.41 | 0.71 | 0.53 | ~4.5s |
+  | siglip2+直查 | 0.53 | 0.82 | 0.67 | ~0.9s |
+  | cnclip+原样 | 0.47 | 0.88 | 0.67 | ~0.2s |
+- 结论：短中文查询直查优于翻译（翻译层降级为 `--translate` 选项）；CN-CLIP hit@5 最高且最快，中文场景可优先尝试。
 
 ## 性能说明（无卡会慢是正常的）
 
@@ -222,13 +244,13 @@ python scripts/03_search.py --help
 | `manifest 为空或不存在，先跑 01_extract.py` | 02 找不到 manifest；先跑 01，确认 `frames/manifest.jsonl` 非空 |
 | `collection 不存在，先跑 02_embed_index.py` | 03 找不到 Chroma collection；先跑 02 |
 | 查询全是 `[文件缺失?]` | 帧文件被删但索引还在；重跑 01 + 02（02 加 `--rebuild`） |
-| 中文查不准 | 已接入翻译层；仍不准时改用英文自然描述，或补 `ZH2EN` 表（离线回退路径） |
+| 中文查不准 | 默认直查已是最优（评测）；仍不准时改用英文自然描述，或试 `--translate` / `--model cnclip`（中文原生，需配对索引） |
 | `dummy` 分数随机 | 无网兜底模式预期行为；有网后重跑 02 自动升级到 SigLIP2/open_clip |
 
 ## Roadmap
 
-- [x] 中文查询接入翻译层：`Helsinki-NLP/opus-mt-zh-en`（懒加载，离线回退关键词映射），2026-09-14。
-- [ ] 中文查询下一步：按 Roadmap 评测集对比 `SigLIP2+翻译` vs `CN-CLIP`，再决定是否换中文原生 encoder。
+- [x] 评测基础设施 `scripts/04_eval.py`（视频级 hit@k/MRR）+ 首轮评测（13 视频 × 17 查询）：短中文查询直查 > opus-mt 翻译；CN-CLIP hit@5 最高、耗时最低；翻译层降级为 `--translate` 可选，2026-09-14。
+- [ ] 扩评测集（20+ 视频、长句/描述型查询）后定默认 encoder 与默认查询路径。
 - [ ] 时间定位更细：场景内多帧去重 + 镜头边界微调，`time` 精度从 0.1s 向帧级对齐。
 - [ ] 检索体验：`03_search.py` 加 `--show` 直接拼图预览 / 输出 HTML 报告。
 - [ ] 增量索引：01 抽帧增量追加、02 按 `video_id` 增量 upsert，避免每次 `--rebuild` 全量重建。

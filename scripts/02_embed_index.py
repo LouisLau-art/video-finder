@@ -65,10 +65,19 @@ class Siglip2Encoder:
 
     def encode_texts(self, texts: list[str]) -> np.ndarray:
         import torch
-        inputs = self.processor(text=texts, return_tensors="pt", padding=True)
+        # SigLIP2 官方要求文本 padding="max_length"(64) —— 训练时用法: 所有文本补到
+        # 定长后取最后一个 token(含 padding)的 hidden state 作表示; 不加 attention_mask
+        # (官方文档示例即如此, 实测加不加结果不同)。定长 padding 同时保证批量与单条
+        # 编码结果完全一致, 不受 batch 组成影响。
+        inputs = self.processor(
+            text=texts,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=64,
+            truncation=True,
+        )
         with torch.no_grad():
-            feats = self.model.get_text_features(**inputs)
-            feats = self._norm(feats)
+            feats = self._norm(self.model.get_text_features(**inputs))
         return feats.cpu().numpy().astype(np.float32)
 
 

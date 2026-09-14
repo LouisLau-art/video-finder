@@ -6,15 +6,29 @@
     python scripts/03_search.py "白色帐篷 草坪 黑人" --topk 10
     python scripts/03_search.py --help
 
-查询词先过简单中英映射(草坪->lawn 等)再编码，encoder 与 02 保持一致
-(读 chroma_db/encoder.json，无文件则按 siglip2->openclip->dummy 顺序自动).
+查询预处理: 含 CJK 汉字([\u4e00-\u9fff])时优先用 Helsinki-NLP/opus-mt-zh-en
+(懒加载, CPU)翻译成英文再编码；模型加载/翻译任何失败则回退现有 ZH2EN 映射，
+保证无网也能用。纯英文查询零翻译开销。
+encoder 与 02 保持一致(读 chroma_db/encoder.json，无文件则按 siglip2->openclip->dummy 顺序自动).
 输出按相似度排序: 分数 + video_id + 秒 + 帧路径(截图).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
+import sys
 from pathlib import Path
+from typing import Protocol, cast
+
+# 中文翻译模型: Helsinki-NLP/opus-mt-zh-en (~300MB), 懒加载, device=-1(CPU)
+TRANSLATE_MODEL_ID = "Helsinki-NLP/opus-mt-zh-en"
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+# 惰性单例状态: False=未尝试加载, True=已尝试
+_TRANSLATOR_TRIED = False
+_TRANSLATOR = None  # ZhEnTranslator | None
+_UNSET = object()  # 区分“未指定(懒加载真实模型)”与“显式 None(不可用, 用于测试/离线)”
 
 # 简单中英映射: 中文词 -> 英文，查询前做字符串替换
 ZH2EN: dict[str, str] = {
@@ -60,6 +74,81 @@ def map_query(q: str) -> str:
     return " ".join(out.split())
 
 
+# ---------- 中文翻译层 (Helsinki-NLP/opus-mt-zh-en) ----------
+
+def has_cjk(s: str) -> bool:
+    """是否含 CJK 汉字([\\u4e00-\\u9fff])，只有含汉字才需要翻译."""
+    return CJK_RE.search(s) is not None
+
+
+class TranslatorLike(Protocol):
+    """翻译器接口(便于测试注入桩)."""
+
+    def translate(self, text: str) -> str: ...
+
+
+class ZhEnTranslator:
+    """Helsinki-NLP/opus-mt-zh-en 中->英翻译器(CPU).
+
+    transformers 5.x 已移除 translation pipeline 任务，这里直接用
+    AutoTokenizer + AutoModelForSeq2SeqLM 生成。
+    """
+
+    def __init__(self):
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        self._tok = AutoTokenizer.from_pretrained(TRANSLATE_MODEL_ID)
+        self._model = AutoModelForSeq2SeqLM.from_pretrained(TRANSLATE_MODEL_ID)
+        self._model.eval()
+        print(f"[translator] 已加载 {TRANSLATE_MODEL_ID} (CPU)")
+
+    def translate(self, text: str) -> str:
+        import torch
+        enc = self._tok(text, return_tensors="pt")
+        with torch.no_grad():
+            # 查询很短, 64 token 上限足够; 用 max_length 避免与生成默认值冲突告警
+            out = self._model.generate(**enc, max_length=64)
+        return self._tok.batch_decode(out, skip_special_tokens=True)[0].strip()
+
+
+def get_translator() -> TranslatorLike | None:
+    """懒加载翻译器单例; 加载失败返回 None 并缓存失败(无网不断链)."""
+    global _TRANSLATOR_TRIED, _TRANSLATOR
+    if not _TRANSLATOR_TRIED:
+        _TRANSLATOR_TRIED = True
+        try:
+            _TRANSLATOR = ZhEnTranslator()
+        except Exception as e:  # noqa: BLE001 — 原型: 无网/缺依赖时回退 ZH2EN
+            print(
+                f"[warn] 翻译模型加载失败({TRANSLATE_MODEL_ID})，回退 ZH2EN 映射: {e}",
+                file=sys.stderr,
+            )
+            _TRANSLATOR = None
+    return cast("TranslatorLike | None", _TRANSLATOR)
+
+
+def resolve_query(
+    raw: str, translator: TranslatorLike | None | object = _UNSET
+) -> tuple[str, str | None]:
+    """查询预处理: 含 CJK 时优先翻译→英文, 失败/不可用回退 ZH2EN 映射.
+
+    translator 缺省 = 懒加载真实模型；显式传对象(测试桩)或 None(禁用翻译)便于测试。
+    返回 (最终查询串, 翻译结果或 None)；纯英文查询零翻译开销直接返回。
+    """
+    if not has_cjk(raw):
+        return map_query(raw), None  # 无汉字: 不碰翻译模型
+    tr: TranslatorLike | None = (
+        get_translator() if translator is _UNSET else cast("TranslatorLike | None", translator)
+    )
+    if tr is not None:
+        try:
+            en = tr.translate(raw)
+            if en:
+                return map_query(en), en
+        except Exception as e:  # noqa: BLE001 — 翻译失败不断链
+            print(f"[warn] 翻译失败，回退 ZH2EN 映射: {e}", file=sys.stderr)
+    return map_query(raw), None
+
+
 def load_encoder(db: str, prefer: str | None):
     """与 02 共用一套 encoder 类：复用 02 的实现，避免两边不一致."""
     import importlib.util
@@ -96,8 +185,12 @@ def main() -> int:
     import chromadb
 
     raw_q = args.query
-    q = map_query(raw_q)
-    if q != raw_q:
+    q, translated = resolve_query(raw_q)
+    if translated:
+        print(f"[query] 翻译(zh->en): {raw_q!r} -> {translated!r}")
+        if q != translated:
+            print(f"[query] 映射: {translated!r} -> {q!r}")
+    elif q != raw_q:
         print(f"[query] 映射: {raw_q!r} -> {q!r}")
     else:
         print(f"[query] {q!r}")

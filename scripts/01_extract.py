@@ -17,7 +17,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+from PIL import Image, ImageStat
+
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg"}
+
+# 黑场/纯色卡过滤阈值（保守取值，宁可漏滤也不误杀暗光正常帧）:
+# - MEAN: 纯黑底(含 JPEG 噪声)灰度均值通常 1~4，品牌黑底 logo 卡实测 1.5~6.5；
+#   正常夜景/暗光画面因有高光与纹理，实测最低均值约 17。取 8 留出安全边界。
+# - STD: 纯色块(含 JPEG 噪声)灰度标准差通常 <4；实测最低的“非纯色”卡(暗底+角标)
+#   为 2.5，而带内容的暗光帧最低约 8.9。取 6 位于两者之间且偏保守。
+# 任一条件命中即丢弃：均值低=近黑，标准差低=纯色/近纯色。
+BLANK_MEAN_THRESHOLD = 8.0
+BLANK_STD_THRESHOLD = 6.0
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -105,6 +116,27 @@ def fallback_timestamps(duration: float | None, fps: float = 1.0) -> list[float]
     return [round(i / fps, 1) for i in range(n)]
 
 
+def frame_gray_stats(img: Image.Image) -> tuple[float, float]:
+    """转灰度后的 (mean, stddev)，用于黑场/纯色判定."""
+    st = ImageStat.Stat(img.convert("L"))
+    return float(st.mean[0]), float(st.stddev[0])
+
+
+def is_blank_frame(
+    img: Image.Image,
+    mean_threshold: float = BLANK_MEAN_THRESHOLD,
+    std_threshold: float = BLANK_STD_THRESHOLD,
+) -> bool:
+    """纯函数: 判断一帧是否为黑场/纯色卡（应丢弃）.
+
+    灰度均值 < mean_threshold  = 近黑（片头尾黑场、黑底 logo 卡）
+    灰度标准差 < std_threshold = 纯色/近纯色（纯色卡、纯字卡）
+    阈值见模块顶部常量的取值依据（保守，避免误杀夜景/暗光正常帧）。
+    """
+    mean, std = frame_gray_stats(img)
+    return mean < mean_threshold or std < std_threshold
+
+
 def process_video(video: Path, frames_dir: Path, fps: float, max_per_scene: int) -> list[dict]:
     video_id = video.stem
     duration = get_duration(video)
@@ -122,19 +154,37 @@ def process_video(video: Path, frames_dir: Path, fps: float, max_per_scene: int)
     # 去重排序，避免同秒重复抽帧
     ts = sorted(set(ts))
     rows: list[dict] = []
+    filtered = 0
     for t in ts:
         fname = f"{video_id}_{t:.1f}.jpg"
         out = frames_dir / fname
         ok = extract_frame(video, t, out)
-        if ok:
-            rows.append({
-                "video_id": video_id,
-                "time": float(t),
-                "frame_path": str(out.as_posix()),
-                "video_path": str(video.as_posix()),
-            })
-        else:
+        if not ok:
             print(f"[warn] 抽帧失败: {video.name} @ {t}s", file=sys.stderr)
+            continue
+        # 落盘前判定: 黑场/纯色卡直接删文件，不写 manifest
+        try:
+            with Image.open(out) as im:
+                blank = is_blank_frame(im)
+        except Exception as e:  # noqa: BLE001 — 读图失败宁可保留，不误杀
+            print(f"[warn] 读帧失败保留 {fname}: {e}", file=sys.stderr)
+            blank = False
+        if blank:
+            out.unlink(missing_ok=True)
+            filtered += 1
+            print(f"[filter] 丢弃黑场/纯色帧: {fname}", file=sys.stderr)
+            continue
+        rows.append({
+            "video_id": video_id,
+            "time": float(t),
+            "frame_path": str(out.as_posix()),
+            "video_path": str(video.as_posix()),
+        })
+    if filtered:
+        print(
+            f"[filter] {video.name}: 过滤 {filtered}/{len(ts)} 帧(黑场/纯色卡)",
+            file=sys.stderr,
+        )
     print(f"[done] {video.name}: {len(rows)}/{len(ts)} 帧")
     return rows
 

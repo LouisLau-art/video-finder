@@ -13,8 +13,9 @@
 ## 功能特性
 
 - **文本搜帧**：英文自然描述（如 `white tent lawn black man`）按相似度排序返回帧。
-- **中文简易映射**：`白色帐篷 草坪` 会先做字符串替换再编码（见下文映射表），复杂查询建议直接写英文。
+- **中文查询**：含汉字时优先走本地翻译模型 `Helsinki-NLP/opus-mt-zh-en`（懒加载，CPU）译成英文再编码；模型不可用/翻译失败自动回退内置关键词映射表，无网不断链。
 - **场景优先抽帧**：优先 PySceneDetect `ContentDetector` 按场景切分，每场景留 1–3 个中间帧；切不出/报错自动回退纯 1fps，不中断。
+- **黑场/纯色卡过滤**：抽帧后丢弃片头尾黑场、纯色卡帧（灰度均值 < 8 或标准差 < 6），不写 manifest，避免污染检索 top1。
 - **Encoder 三档自动回退**：`SigLIP2（google/siglip2-base-patch16-224）→ open_clip ViT-B/32（laion2b_s34b_b79k）→ dummy 哈希（仅保链路）`，实际用哪个会写进 `chroma_db/encoder.json`，查询时自动对齐，保证图文同一向量空间。
 - **本地持久化**：向量存 `chroma_db/`（cosine 空间），payload 含 `video_id / time / frame_path`，拿着 `frame_path` 直接打开 jpg 就是截图，`video_id + time` 可回跳原视频对应秒数。
 - **CPU 友好**：默认 `--batch-size 4`，小内存可用 `--batch-size 2`。
@@ -40,7 +41,7 @@ Chroma 本地索引 (chroma_db/, collection=frames, hnsw:space=cosine)
   + chroma_db/encoder.json (记录实际 encoder)
   │
   ▼
-查询: 文本 → 中英映射 → 同一 encoder 编码 → Chroma query
+查询: 文本 → 中文翻译(含汉字时, 离线回退关键词映射) → 同一 encoder 编码 → Chroma query
   → 排序输出 rank / score / dist / video_id / time / frame_path
 ```
 
@@ -116,14 +117,15 @@ python scripts/03_search.py "white tent lawn" --topk 20
 python scripts/03_search.py "white tent lawn black man" --topk 20
 ```
 
-中文查询（内置简易映射，仅字符串替换）：
+中文查询（优先翻译模型，离线回退内置映射）：
 
 ```bash
 python scripts/03_search.py "白色帐篷 草坪" --topk 10
-# 终端会打印：[query] 映射: '白色帐篷 草坪' -> 'white tent lawn'
+# 终端会打印：[query] 翻译(zh->en): '白色帐篷 草坪' -> 'white tent lawn'
+# 离线/模型不可用时回退：[query] 映射: '白色帐篷 草坪' -> 'white tent lawn'
 ```
 
-映射原理（`scripts/03_search.py` 顶部 `ZH2EN` 表，查询前做字符串替换，前后补空格避免粘连）：
+翻译不可用时用的兜底映射原理（`scripts/03_search.py` 顶部 `ZH2EN` 表，按长词优先做字符串替换，前后补空格避免粘连）：
 
 | 中文 | 映射英文 | 中文 | 映射英文 |
 |---|---|---|---|
@@ -220,12 +222,13 @@ python scripts/03_search.py --help
 | `manifest 为空或不存在，先跑 01_extract.py` | 02 找不到 manifest；先跑 01，确认 `frames/manifest.jsonl` 非空 |
 | `collection 不存在，先跑 02_embed_index.py` | 03 找不到 Chroma collection；先跑 02 |
 | 查询全是 `[文件缺失?]` | 帧文件被删但索引还在；重跑 01 + 02（02 加 `--rebuild`） |
-| 中文查不准 | 映射表只是关键词替换；改用英文自然描述 |
+| 中文查不准 | 已接入翻译层；仍不准时改用英文自然描述，或补 `ZH2EN` 表（离线回退路径） |
 | `dummy` 分数随机 | 无网兜底模式预期行为；有网后重跑 02 自动升级到 SigLIP2/open_clip |
 
 ## Roadmap
 
-- [ ] 更准的中文查询：接入中文 text encoder 或翻译层，替换现有关键词映射表。
+- [x] 中文查询接入翻译层：`Helsinki-NLP/opus-mt-zh-en`（懒加载，离线回退关键词映射），2026-09-14。
+- [ ] 中文查询下一步：按 Roadmap 评测集对比 `SigLIP2+翻译` vs `CN-CLIP`，再决定是否换中文原生 encoder。
 - [ ] 时间定位更细：场景内多帧去重 + 镜头边界微调，`time` 精度从 0.1s 向帧级对齐。
 - [ ] 检索体验：`03_search.py` 加 `--show` 直接拼图预览 / 输出 HTML 报告。
 - [ ] 增量索引：01 抽帧增量追加、02 按 `video_id` 增量 upsert，避免每次 `--rebuild` 全量重建。

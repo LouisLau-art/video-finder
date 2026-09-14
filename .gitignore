@@ -40,3 +40,7 @@ eval_local/
 
 # Local runtime + sensitive local data: NAS trees, chat exports, frames, indexes, ops scripts
 data/
+
+# Local tooling state (opencode plugin deps / magic-context)
+.cortexkit/
+.opencode/

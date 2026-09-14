@@ -28,6 +28,7 @@ def load_module(name: str, filename: str):
 m01 = load_module("mod_01_extract", "01_extract.py")
 m02 = load_module("mod_02_embed_index", "02_embed_index.py")
 m03 = load_module("mod_03_search", "03_search.py")
+m04 = load_module("mod_04_eval", "04_eval.py")
 
 
 # ---------- 01_extract ----------
@@ -321,6 +322,153 @@ def test_siglip2_encode_texts_uses_max_length_padding():
     assert out.shape == (3, 4)
     for v in out:
         assert float(np.linalg.norm(v)) == pytest.approx(1.0, abs=1e-5)
+
+
+# ---------- 03_search encoder 门控: cnclip 原样, siglip2/openclip 走翻译层 ----------
+
+def test_resolve_query_for_encoder_cnclip_raw_no_translator():
+    # cnclip 中文原生: 原样返回, 即使注入了翻译桩也绝不调用
+    bomb = _StubTranslator(error=RuntimeError("不应被调用"))
+    q, tr = m03.resolve_query_for_encoder("红色背心", "cnclip", translator=bomb)
+    assert (q, tr) == ("红色背心", None)
+    assert bomb.calls == []
+
+
+def test_resolve_query_for_encoder_cnclip_never_lazy_loads(monkeypatch):
+    # cnclip 默认路径也不得触碰懒加载翻译器
+    called: list[str] = []
+    monkeypatch.setattr(m03, "ZhEnTranslator", lambda: called.append("load"))
+    q, tr = m03.resolve_query_for_encoder("红色背心", "cnclip")
+    assert (q, tr) == ("红色背心", None)
+    assert called == []
+
+
+def test_resolve_query_for_encoder_cnclip_mixed_text_unchanged():
+    q, tr = m03.resolve_query_for_encoder("白色帐篷 white tent", "cnclip")
+    assert q == "白色帐篷 white tent"
+    assert tr is None
+
+
+def test_resolve_query_for_encoder_siglip2_default_no_translate():
+    # 默认中文直查: 只过 ZH2EN 映射, 不触碰翻译器(评测: 短中文查询直查更优)
+    bomb = _StubTranslator(error=RuntimeError("不应被调用"))
+    q, tr = m03.resolve_query_for_encoder("红色背心", "siglip2", translator=bomb)
+    assert (q, tr) == ("红色背心", None)
+    assert bomb.calls == []
+
+
+def test_resolve_query_for_encoder_siglip2_translate_flag():
+    stub = _StubTranslator(out="red vest")
+    q, tr = m03.resolve_query_for_encoder("红色背心", "siglip2", translator=stub, translate=True)
+    assert (q, tr) == ("red vest", "red vest")
+    assert stub.calls == ["红色背心"]
+
+
+def test_resolve_query_for_encoder_openclip_translate_flag():
+    stub = _StubTranslator(out="white tent")
+    q, tr = m03.resolve_query_for_encoder("白色帐篷", "openclip", translator=stub, translate=True)
+    assert (q, tr) == ("white tent", "white tent")
+    assert stub.calls == ["白色帐篷"]
+
+
+def test_resolve_query_for_encoder_siglip2_translator_none_zh2en():
+    # --translate 且翻译器不可用: 回退 ZH2EN 兜底行为
+    q, tr = m03.resolve_query_for_encoder("白色帐篷", "siglip2", translator=None, translate=True)
+    assert tr is None
+    assert "tent" in q.split()
+
+
+# ---------- 02_embed_index.CnClipEncoder: 编码参数与输出归一化 (桩, 不下载模型) ----------
+
+class _FakePoolingOutput:
+    """模拟 transformers 5.x get_*_features 返回的 BaseModelOutputWithPooling."""
+
+    def __init__(self, t):
+        self.pooler_output = t
+
+
+def test_cnclip_encode_texts_padding_truncation_and_norm():
+    import torch
+
+    calls: list[dict] = []
+
+    class _FakeProcessor:
+        def __call__(self, text=None, images=None, return_tensors=None, **kwargs):
+            calls.append({"text": list(text), "return_tensors": return_tensors, **kwargs})
+            return {"input_ids": torch.ones(len(text), 8, dtype=torch.long)}
+
+    class _FakeModel:
+        def get_text_features(self, input_ids, **kwargs):
+            return _FakePoolingOutput(torch.ones(input_ids.shape[0], 4))
+
+    enc = object.__new__(m02.CnClipEncoder)
+    enc.processor = _FakeProcessor()
+    enc.model = _FakeModel()
+    out = enc.encode_texts(["红色背心", "跑步马甲"])
+    assert calls == [{
+        "text": ["红色背心", "跑步马甲"], "return_tensors": "pt",
+        "padding": True, "truncation": True,
+    }]
+    assert out.shape == (2, 4)
+    for v in out:
+        assert float(np.linalg.norm(v)) == pytest.approx(1.0, abs=1e-5)
+
+
+def test_cnclip_encode_images_norm_from_pooling_output():
+    import torch
+
+    seen: list[int] = []
+
+    class _FakeProcessor:
+        def __call__(self, images=None, return_tensors=None, **kwargs):
+            seen.append(len(images))
+            return {"pixel_values": torch.ones(len(images), 3, 4, 4)}
+
+    class _FakeModel:
+        def get_image_features(self, pixel_values, **kwargs):
+            return _FakePoolingOutput(torch.ones(pixel_values.shape[0], 4))
+
+    enc = object.__new__(m02.CnClipEncoder)
+    enc.processor = _FakeProcessor()
+    enc.model = _FakeModel()
+    imgs = [Image.new("RGB", (8, 8), (255, 0, 0)),
+            Image.new("RGB", (8, 8), (0, 255, 0))]
+    out = enc.encode_images(imgs)
+    assert seen == [2]
+    assert out.shape == (2, 4)
+    for v in out:
+        assert float(np.linalg.norm(v)) == pytest.approx(1.0, abs=1e-5)
+
+
+# ---------- 04_eval 指标纯函数 (不碰模型/chroma) ----------
+
+def test_ranked_video_ids_dedupes_preserving_order():
+    metas = [{"video_id": "a"}, {"video_id": "a"}, {"video_id": "b"},
+             {}, {"video_id": "c"}, {"video_id": "a"}]
+    assert m04.ranked_video_ids(metas) == ["a", "b", "c"]
+
+
+def test_hit_at_k_boundaries():
+    ranked = ["a", "b", "c", "d", "e", "f"]
+    assert m04.hit_at_k(ranked, ["e"], 5) is True
+    assert m04.hit_at_k(ranked, ["e"], 4) is False
+    assert m04.hit_at_k(ranked, ["f"], 10) is True   # k 超出排名长度
+    assert m04.hit_at_k(ranked, ["z"], 10) is False
+    assert m04.hit_at_k(ranked, ["a"], 0) is False
+    assert m04.hit_at_k(ranked, [], 3) is False
+
+
+def test_reciprocal_rank_first_hit_and_miss():
+    assert m04.reciprocal_rank(["a"], ["a"]) == 1.0
+    assert m04.reciprocal_rank(["x", "b", "a"], ["a", "b"]) == pytest.approx(0.5)
+    assert m04.reciprocal_rank(["x", "y"], ["a"]) == 0.0
+    assert m04.reciprocal_rank([], ["a"]) == 0.0
+
+
+def test_evaluate_ranking_hits_and_rr():
+    out = m04.evaluate_ranking(["x", "a"], ["a"], ks=(1, 2, 10))
+    assert out["hits"] == {1: False, 2: True, 10: True}
+    assert out["rr"] == pytest.approx(0.5)
 
 
 # ---------- 可选：DummyEncoder + chromadb 最小链路 ----------

@@ -6,9 +6,12 @@
     python scripts/03_search.py "白色帐篷 草坪 黑人" --topk 10
     python scripts/03_search.py --help
 
-查询预处理: 含 CJK 汉字([\u4e00-\u9fff])时优先用 Helsinki-NLP/opus-mt-zh-en
-(懒加载, CPU)翻译成英文再编码；模型加载/翻译任何失败则回退现有 ZH2EN 映射，
-保证无网也能用。纯英文查询零翻译开销。
+查询预处理按 encoder 决定:
+- cnclip(中文原生): 查询原样直接编码，不翻译、不过 ZH2EN。
+- siglip2/openclip: 默认中文直查(仅过 ZH2EN 映射)——评测显示短中文查询直查
+  命中率/延迟均优于翻译；加 --translate 启用 Helsinki-NLP/opus-mt-zh-en
+  (懒加载, CPU)翻译成英文再编码，模型加载/翻译任何失败则回退 ZH2EN 映射，
+  保证无网也能用。纯英文查询零翻译开销。
 encoder 与 02 保持一致(读 chroma_db/encoder.json，无文件则按 siglip2->openclip->dummy 顺序自动).
 输出按相似度排序: 分数 + video_id + 秒 + 帧路径(截图).
 """
@@ -149,6 +152,27 @@ def resolve_query(
     return map_query(raw), None
 
 
+def resolve_query_for_encoder(
+    raw: str,
+    encoder_name: str,
+    translator: TranslatorLike | None | object = _UNSET,
+    translate: bool = False,
+) -> tuple[str, str | None]:
+    """按 encoder 决定查询预处理.
+
+    cnclip 是中文原生: 原样返回, 绝不调用翻译层;
+    siglip2/openclip: 默认仅过 ZH2EN 映射(中文直查)——评测显示短中文查询
+    直查命中率/延迟均优于翻译; 显式 translate=True 时启用 opus-mt 翻译层
+    (失败/离线回退 ZH2EN)。
+    返回 (最终查询串, 翻译结果或 None)。
+    """
+    if encoder_name == "cnclip":
+        return raw, None
+    if translate:
+        return resolve_query(raw, translator)
+    return map_query(raw), None
+
+
 def load_encoder(db: str, prefer: str | None):
     """与 02 共用一套 encoder 类：复用 02 的实现，避免两边不一致."""
     import importlib.util
@@ -164,7 +188,7 @@ def load_encoder(db: str, prefer: str | None):
     if meta.exists():
         try:
             name = json.loads(meta.read_text(encoding="utf-8")).get("encoder")
-            if name in ("siglip2", "openclip", "dummy"):
+            if name in ("siglip2", "cnclip", "openclip", "dummy"):
                 print(f"[encoder] 按 encoder.json 用 {name}")
                 return mod.build_encoder(name)
         except Exception as e:
@@ -178,15 +202,22 @@ def main() -> int:
     ap.add_argument("--topk", type=int, default=20, help="返回前 K 个结果")
     ap.add_argument("--db", default="chroma_db")
     ap.add_argument("--collection", default="frames")
-    ap.add_argument("--model", default=None, choices=["siglip2", "openclip", "dummy"],
+    ap.add_argument("--model", default=None, choices=["siglip2", "cnclip", "openclip", "dummy"],
                     help="强制指定 encoder，默认读 encoder.json")
+    ap.add_argument("--translate", action="store_true",
+                    help="启用 opus-mt 中文翻译层(默认关闭: 评测显示短中文查询直查更优; "
+                         "仅对 siglip2/openclip 有效; 失败/离线回退 ZH2EN)")
     args = ap.parse_args()
 
     import chromadb
 
     raw_q = args.query
-    q, translated = resolve_query(raw_q)
-    if translated:
+    # 先定 encoder: 查询预处理方式(cnclip 原样 / siglip2 直查或翻译)依赖 encoder
+    encoder = load_encoder(args.db, args.model)
+    q, translated = resolve_query_for_encoder(raw_q, encoder.name, translate=args.translate)
+    if encoder.name == "cnclip":
+        print(f"[query] 中文原生(encoder=cnclip, 不翻译): {q!r}")
+    elif translated:
         print(f"[query] 翻译(zh->en): {raw_q!r} -> {translated!r}")
         if q != translated:
             print(f"[query] 映射: {translated!r} -> {q!r}")
@@ -195,7 +226,6 @@ def main() -> int:
     else:
         print(f"[query] {q!r}")
 
-    encoder = load_encoder(args.db, args.model)
     q_emb = encoder.encode_texts([q])
 
     client = chromadb.PersistentClient(path=args.db)

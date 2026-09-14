@@ -37,3 +37,6 @@ build/
 
 # Local evaluation data (company video names / reports — never publish)
 eval_local/
+
+# Local runtime + sensitive local data: NAS trees, chat exports, frames, indexes, ops scripts
+data/

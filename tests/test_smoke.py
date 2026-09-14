@@ -471,6 +471,40 @@ def test_evaluate_ranking_hits_and_rr():
     assert out["rr"] == pytest.approx(0.5)
 
 
+class _EvalTranslatorStub:
+    def translate(self, text: str) -> str:
+        return "RED VEST"
+
+
+def test_preprocess_translate_mode_passes_translator_and_flag():
+    """translate 模式必须显式带 translate=True + 翻译器, 否则会静默退化成直查."""
+    class _M3:
+        def __init__(self):
+            self.calls: dict | None = None
+        def get_translator(self):
+            return _EvalTranslatorStub()
+        def resolve_query_for_encoder(self, raw, model, translator=None, translate=False):
+            self.calls = {"translator": translator, "translate": translate}
+            return "red vest", "RED VEST"
+
+    stub_m3 = _M3()
+    q, tr = m04.preprocess_for_mode(stub_m3, "红色背心", "siglip2", "translate")
+    assert (q, tr) == ("red vest", "RED VEST")
+    assert stub_m3.calls is not None
+    assert isinstance(stub_m3.calls["translator"], _EvalTranslatorStub)
+    assert stub_m3.calls["translate"] is True
+
+
+def test_preprocess_translate_mode_raises_when_model_unavailable():
+    """翻译器不可用时大声失败, 禁止静默回退造数."""
+    class _M3:
+        def get_translator(self):
+            return None
+
+    with pytest.raises(RuntimeError):
+        m04.preprocess_for_mode(_M3(), "红色背心", "siglip2", "translate")
+
+
 # ---------- 可选：DummyEncoder + chromadb 最小链路 ----------
 
 def test_dummy_chroma_upsert_query_minimal(tmp_path):

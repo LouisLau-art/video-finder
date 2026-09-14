@@ -119,7 +119,16 @@ def build_index(manifest: Path, db: Path, model: str, batch_size: int) -> float:
 def preprocess_for_mode(m3, raw: str, model: str, mode: str) -> tuple[str, str | None]:
     """按配置预处理查询 (复用 03 的门控逻辑)."""
     if mode == "translate":
-        return m3.resolve_query_for_encoder(raw, model)
+        # 显式取翻译器: 不可用时必须大声失败, 否则该配置会静默退化成直查,
+        # 产出"翻译 vs 直查相同"的假结论 (2026-09-14 踩过)。
+        translator = m3.get_translator()
+        if translator is None:
+            raise RuntimeError(
+                "opus-mt 翻译模型不可用，siglip2+tr 配置拒绝静默回退；"
+                "请检查模型缓存/网络后重跑"
+            )
+        return m3.resolve_query_for_encoder(
+            raw, model, translator=translator, translate=True)
     if mode == "zh2en":
         return m3.resolve_query_for_encoder(raw, model, translator=None)
     if mode == "raw":
@@ -220,8 +229,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="视频级检索评测: 多配置对比 (hit@k/MRR)")
     ap.add_argument("--queries", default="eval_local/queries.json",
                     help="评测查询 JSON 路径")
-    ap.add_argument("--db-root", default="/tmp/vf_eval_chroma",
-                    help="每个模型建索引的根目录 (默认 /tmp/vf_eval_chroma)")
+    ap.add_argument("--db-root", default="data/local-runtime/eval_chroma",
+                    help="每个模型建索引的根目录 (默认 data/local-runtime/eval_chroma)")
     ap.add_argument("--out", default="eval_local/report.json", help="JSON 报告输出路径")
     ap.add_argument("--configs", default=",".join(DEFAULT_CONFIGS),
                     help=f"逗号分隔, 可选: {', '.join(CONFIG_SPECS)}")

@@ -44,3 +44,6 @@ data/
 # Local tooling state (opencode plugin deps / magic-context)
 .cortexkit/
 .opencode/
+
+# Local issue tracker + specs (engineering skills) — 可能含公司素材，不入公开仓库
+.scratch/

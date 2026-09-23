@@ -91,6 +91,9 @@ NAS_PATH_MAP: dict[str, str] = {
     "item-vest-c": "share-a/0video/products/0.2026/26AW/item-xdir-vest-c2.0/item-vest-c.mp4",
     "item-coat-a": "share-a/0video/products/0.2026/26AW/item-xdir-coat2.0/item-coat-a.mp4",
     "item-zip-a": "share-a/0video/products/0.2026/26AW/item-zdir-zip3.0/item-zip-a.mp4",
+    "clip-caravan-intro": "archive-share/0video/clip-caravan-intro/clip-caravan-intro.mp4",
+    "clip-caravan-a": "archive-share/0video/products/series-a/2024年/clip-caravan-a.mp4",
+    "clip-caravan-b": "archive-share/0video/products/series-a/2024年/clip-caravan-b.mp4",
 }
 
 # 由 main()/--参数写入的运行时配置（ensure_state 懒加载时读取）

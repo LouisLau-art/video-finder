@@ -14,7 +14,7 @@
 
 ## 核心能力
 
-- **中文文本搜帧**：自然语言直查，如「夜跑 红色背心 冲刺」「yarn-item特写 纺织细节」「白色item-cap」，返回视频级排名 + 命中秒数 + 关键帧图。
+- **中文文本搜帧**：自然语言直查，如「夜跑 红色背心 冲刺」「白色帐篷 草坪」「竞速瞬间瞬间」，返回视频级排名 + 命中秒数 + 关键帧图。
 - **以图搜图**：上传 / 拖拽一张参考图（或 base64 JSON），不用任何文字，直接按画面特征检索到相同镜头；实测命中原视频同时刻帧相似度 100%。
 - **场景感知抽帧**：PySceneDetect 场景切分、每场景取 1–3 个中间帧，切不出自动回退纯 1fps；片头尾黑场 / 纯色卡自动过滤，避免污染 top1。
 - **多 encoder 可插拔 + 自动对齐**：`SigLIP2 → open_clip → dummy` 自动回退，可选中文原生 `CN-CLIP`；实际 encoder 写入索引元数据，查询时自动配对，保证图文同一向量空间。
@@ -108,6 +108,23 @@ python scripts/03_search.py "白色帐篷 草坪" --topk 10
 #       --translate（启用 opus-mt 翻译层，默认直查） --topk 20
 ```
 
+### 站点私有配置（NAS / 隧道）
+
+内网的 NAS 地址、共享映射与隧道参数放在**仓库之外**，不进 git：
+
+```bash
+mkdir -p ~/.config/video-finder
+cp docs/site.example.json ~/.config/video-finder/site.json
+chmod 600 ~/.config/video-finder/site.json
+# 按示例格式填写真实值：nas（smb_host/prefix/synology_web_base/path_map）、
+# shares（share/mount/name 列表）、tunnel（user/host/remote_port/local_port）
+```
+
+读取顺序：`$VF_SITE_CONFIG` → `~/.config/video-finder/site.json` → `./site.json`；
+缺失则以降级空配置运行（本地最小链路不受影响）。
+相关脚本：`scripts/site_config.py`（`get nas.smb_host` / `shares` / `tunnel`）、
+`scripts/mount_nas.sh`（幂等挂载）、`scripts/keep_tunnel.sh`（服务与隧道保活）。
+
 ## 检索服务 API（`scripts/05_api.py`）
 
 ```bash
@@ -183,7 +200,7 @@ bash scripts/mount_nas.sh
 
 # 3) 按目录分片跑高价值内容（可断点续跑，重复执行自动 skip 已完成）
 nohup .venv/bin/python scripts/06_index_all.py \
-  --include-dir products --workers 3 --nice 10 \
+  --include-dir <目录关键字> --workers 3 --nice 10 \
   > /tmp/index_full.log 2>&1 &
 
 # 4) 全量（数百 GB+ 素材，10 万帧级；CPU 12 核估算 6–10 小时）

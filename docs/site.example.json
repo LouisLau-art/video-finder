@@ -1,0 +1,16 @@
+{
+  "nas": {
+    "smb_host": "smb://nas.local",
+    "prefix": "share/0video",
+    "synology_web_base": "http://nas.local:5000",
+    "path_map": {
+      "demo_clip_01": "share/folder/demo_clip_01.mp4",
+      "demo_clip_02": "share/archive/demo_clip_02.mp4"
+    }
+  },
+  "shares": [
+    {"share": "//nas.local/share1", "mount": "/mnt/share1", "name": "share1"},
+    {"share": "//nas.local/share2", "mount": "/mnt/share2", "name": "share2"}
+  ],
+  "tunnel": {"user": "root", "host": "relay.example.com", "remote_port": 18000, "local_port": 8000}
+}

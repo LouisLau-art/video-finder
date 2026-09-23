@@ -58,11 +58,33 @@ PRUNE_DIRNAMES = {
     "@eadir", "#recycle", "#snapshot",
 }
 
-# 本地挂载点 -> NAS 共享名（与 05_api NAS_PATH_MAP 的 "share-a/..." 前缀对齐）
-SHARE_MAP = {
-    "/mnt/nas": "share-a",
-    "/mnt/nas-gd": "archive-share",
-}
+# 本地挂载点 -> 共享名：由仓库外的 site.json 的 shares 派生；
+# 无配置时为空，share_of 兜底用目录名（不影响本地最小链路）。
+def _load_share_map() -> dict:
+    """shares 列表 -> {mount: name}；失败返回空 dict。"""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "site_config", str(SCRIPTS / "site_config.py"))
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        out: dict = {}
+        for s in mod.load().get("shares", []) or []:
+            if isinstance(s, dict) and s.get("mount") and s.get("name"):
+                out[str(s["mount"]).rstrip("/")] = str(s["name"])
+        return out
+    except Exception:
+        return {}
+
+
+SHARE_MAP = _load_share_map()
+
+
+def _default_roots() -> list[str]:
+    """--roots 默认值：site.json 的 shares 挂载点列表；无配置时退回本地默认。"""
+    if SHARE_MAP:
+        return sorted(SHARE_MAP)
+    return ["/mnt/nas"]
 
 DEFAULT_FRAMES_DIR = "data/local-runtime/frames_full"
 DEFAULT_DB = "data/local-runtime/index_full"
@@ -259,7 +281,7 @@ def fmt_gb(n: int) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="全量 NAS 视频批量索引（抽帧->CN-CLIP->Chroma）")
-    ap.add_argument("--roots", nargs="+", default=["/mnt/nas", "/mnt/nas-gd"])
+    ap.add_argument("--roots", nargs="+", default=_default_roots())
     ap.add_argument("--include-dir", action="append", default=[],
                     help="只收录 relpath 含该子串的视频（可重复）")
     ap.add_argument("--exclude-dir", action="append", default=[],

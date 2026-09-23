@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
 # mount_nas.sh — 幂等挂载 NAS 只读共享（video-finder 全量索引用）。
 #
-#   共享1: //nas.example.invalid/share-a        -> /mnt/nas
-#   共享2: //nas.example.invalid/archive-share -> /mnt/nas-gd
+# 共享与挂载点来自仓库外的站点配置（`python3 scripts/site_config.py shares`，
+# 每行 share<TAB>mount<TAB>name），本文件不存任何真实地址。
+# 站点配置示例见 docs/site.example.json。
 #
 # 行为:
-#   1) 把 /home/louis/.config/video-finder/smb_auth（"key = value" 带空格格式）
-#      规范化为 /root/.smbcreds（"key=value" 无空格，600），内容无变化才跳过写入；
+#   1) 把 "${SRC_AUTH}"（"key = value" 带空格格式）规范化为 /root/.smbcreds
+#      （"key=value" 无空格，600），内容无变化才跳过写入；
 #   2) 逐个检查挂载点（mountpoint -q），已挂载则跳过，未挂载才 mount -t cifs …ro…；
 #   3) 可重复执行，第二次应全部 SKIP。
 #
 # 用法: sudo bash scripts/mount_nas.sh
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_AUTH="/home/louis/.config/video-finder/smb_auth"
 DST_CREDS="/root/.smbcreds"
-
-SHARE1="//nas.example.invalid/share-a"
-MNT1="/mnt/nas"
-SHARE2="//nas.example.invalid/archive-share"
-MNT2="/mnt/nas-gd"
 
 # 1) 规范化凭证：去掉 " = " 两侧空格 -> "="
 normalize_creds() {
@@ -55,7 +52,19 @@ mount_one() {
     echo "[mount] OK 已挂载: $share -> $mnt"
 }
 
+# 3) 从站点配置读共享列表（无配置时友好报错退出 1）
+SHARES_OUT="$(python3 "$SCRIPT_DIR/site_config.py" shares)" || {
+    echo "[mount] 读取站点配置失败：请先配置 site.json（参见 docs/site.example.json）" >&2
+    exit 1
+}
+if [[ -z "$SHARES_OUT" ]]; then
+    echo "[mount] 共享列表为空：请先配置 site.json（参见 docs/site.example.json），或设置 VF_SITE_CONFIG" >&2
+    exit 1
+fi
+
 normalize_creds
-mount_one "$SHARE1" "$MNT1"
-mount_one "$SHARE2" "$MNT2"
+while IFS=$'\t' read -r share mnt _name; do
+    [[ -z "$share" || -z "$mnt" ]] && continue
+    mount_one "$share" "$mnt"
+done <<< "$SHARES_OUT"
 echo "[mount] done"

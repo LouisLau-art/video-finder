@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """05_api.py — 视频检索 FastAPI 接口服务.
 
-把 03_search.py 的检索能力封装为标准 HTTP 接口，供平台前端平台前端跨域调用。
+把 03_search.py 的检索能力封装为标准 HTTP 接口，供 Web 前端跨域调用。
 
 接口:
     POST /api/search          文本搜视频帧 (请求体见 SearchRequest)
@@ -14,10 +14,14 @@
     encoder 加载 (load_encoder) 与查询预处理 (resolve_query_for_encoder)
     均从 03_search.py 动态导入，保证与 CLI 一致。
 
+站点私有配置（NAS 前缀/路径映射等）来自仓库外的 site.json
+（见 scripts/site_config.py），缺失则以降级空配置运行。
+
 向量库:
     --db 显式指定则用之；缺省按顺序探测存在者:
-      1) data/local-runtime/eval_chroma/cnclip
-      2) chroma_db
+      1) data/local-runtime/index_full/cnclip
+      2) data/local-runtime/eval_chroma/cnclip
+      3) chroma_db
 
 用法:
     uv run python scripts/05_api.py                       # 默认探测库，端口 8000
@@ -63,41 +67,38 @@ DEFAULT_FRAMES_CANDIDATES = [
     "frames",
 ]
 
-NAS_PREFIX = "share-a/0video"
-NAS_HOST = "smb://nas.example.invalid"
-SYNOLOGY_WEB_BASE = "http://nas.example.invalid:5000"
+# 站点私有配置（NAS 前缀/映射表等）全部来自仓库外的 site.json，
+# 缺失则给空值/空 map（降级运行，不影响本地最小链路）。
+def _load_site_nas() -> dict[str, Any]:
+    """读 site.json 的 nas section；失败返回空默认。"""
+    try:
+        path = Path(__file__).resolve().parent / "site_config.py"
+        spec = importlib.util.spec_from_file_location("site_config", str(path))
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        nas = mod.load().get("nas", {}) or {}
+        return nas if isinstance(nas, dict) else {}
+    except Exception:
+        return {}
+
+
+_SITE_NAS = _load_site_nas()
+NAS_PREFIX = str(_SITE_NAS.get("prefix", "") or "")
+NAS_HOST = str(_SITE_NAS.get("smb_host", "") or "")
+SYNOLOGY_WEB_BASE = str(_SITE_NAS.get("synology_web_base", "") or "")
+_raw_path_map = _SITE_NAS.get("path_map", {}) or {}
+NAS_PATH_MAP: dict[str, str] = (
+    {str(k): str(v) for k, v in _raw_path_map.items()}
+    if isinstance(_raw_path_map, dict) else {}
+)
 
 # 以图搜图：上传大小上限 15MB；允许的图片后缀；JSON base64 兼容键名
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 IMAGE_BASE64_KEYS = ("image_base64", "imageBase64", "image", "base64")
 
-# 真实 NAS 相对路径映射表（从 NAS 真实目录树快照提取，覆盖当前全部 20 个评测素材）
-NAS_PATH_MAP: dict[str, str] = {
-    "clip-redvest": "share-a/0video/clip-redvest.mp4",
-    "race-a": "share-a/0video/品牌/race-a.mp4",
-    "clip-1010": "share-a/0video/品牌/clip-1010.mp4",
-    "clip-story": "share-a/0video/folder-2026/clip-story.mp4",
-    "clip-htc": "share-a/0video/品牌/documentary/clip-htc.mp4",
-    "clip-steady": "share-a/0video/品牌/culture/clip-steady.mp4",
-    "clip-newyear": "share-a/0video/品牌/culture/clip-newyear.mp4",
-    "clip-rotate": "share-a/0video/folder-3d/folder-3d-proj/素材/clip-rotate.mp4",
-    "item-yarn-a": "share-a/0video/products/0.2026/26item-y3D/yarn-item/item-yarn-a.mp4",
-    "item-pants": "share-a/0video/products/0.2026/item-pants/item-pants.mp4",
-    "clip-training-mix": "share-a/0video/products/0.2026/spring-training/clip-training-mix.mp4",
-    "clip-person-a": "share-a/0video/products/0.2026/7月brand-runners-assets/clip-person-a.mp4",
-    "clip-together": "share-a/0video/品牌/culture/folder-expo/screen/clip-together.mp4",
-    "item-cap-a": "share-a/0video/products/0.2026/6.2item-cap/item-cap/item-cap-a.mp4",
-    "item-tee-a": "share-a/0video/products/0.2026/26AW/加厚item-y圆领T恤 升级版/item-tee-a.mp4",
-    "item-vest-a": "share-a/0video/products/0.2026/26AW/dir-vest-a/item-vest-a.mp4",
-    "item-vest-b": "share-a/0video/products/0.2026/26AW/dir-vest-b/item-vest-b.mp4",
-    "item-vest-c": "share-a/0video/products/0.2026/26AW/item-xdir-vest-c2.0/item-vest-c.mp4",
-    "item-coat-a": "share-a/0video/products/0.2026/26AW/item-xdir-coat2.0/item-coat-a.mp4",
-    "item-zip-a": "share-a/0video/products/0.2026/26AW/item-zdir-zip3.0/item-zip-a.mp4",
-    "clip-caravan-intro": "archive-share/0video/clip-caravan-intro/clip-caravan-intro.mp4",
-    "clip-caravan-a": "archive-share/0video/products/series-a/2024年/clip-caravan-a.mp4",
-    "clip-caravan-b": "archive-share/0video/products/series-a/2024年/clip-caravan-b.mp4",
-}
+# 视频 ID -> 站点内网完整路径（随 site.json 下发，本仓库不存真实值）
 
 # 由 main()/--参数写入的运行时配置（ensure_state 懒加载时读取）
 APP_DB = ""
@@ -189,7 +190,7 @@ def format_time(t: float) -> str:
 
 
 def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any]:
-    """单条 chroma 命中 -> 前端平台契约的 result 项。"""
+    """单条 chroma 命中 -> 前端契约的 result 项。"""
     score = max(min(float(score), 1.0), 0.0)
     video_id = str(meta.get("video_id", ""))
     video_name = f"{video_id}.mp4"
@@ -198,19 +199,27 @@ def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any
     filename = Path(frame_path).name
 
     # NAS 路径：全量索引的 metadata 自带 share+relpath 时直拼最准；
-    # 旧评测库无该字段，走真实路径映射表；最后兜底拼一级目录。
+    # 旧评测库无该字段，走站点下发的路径映射表；最后兜底拼一级目录。
     share = str(meta.get("share") or "")
     relpath = str(meta.get("relpath") or "")
     if share and relpath:
         nas_path = f"{share}/{relpath}"
-    else:
+    elif NAS_PREFIX:
         nas_path = NAS_PATH_MAP.get(video_id, f"{NAS_PREFIX}/{video_name}")
+    else:
+        # 无站点配置：只给映射表命中，否则退化为纯文件名（不含内网信息）
+        nas_path = NAS_PATH_MAP.get(video_id, video_name)
 
-    # 群晖 DSM 标准深链协议：直接拉起 File Station 并自动定位展开所在文件夹
-    # 路径需为双重 URL 编码（%252F...），且定位到所在文件夹（带末尾斜杠）
-    folder_path = "/" + str(Path(nas_path).parent).replace("\\", "/") + "/"
-    double_encoded_folder = urllib.parse.quote(urllib.parse.quote(folder_path, safe=""), safe="")
-    synology_web_url = f"{SYNOLOGY_WEB_BASE}/index.cgi?launchApp=SYNO.SDS.App.FileStation3.Instance&launchParam=openfile%3D{double_encoded_folder}"
+    # 站点文件管理器的深链协议：直接定位展开所在文件夹
+    # 路径需为双重 URL 编码（%252F...），且定位到所在文件夹（带末尾斜杠）；
+    # 未配置基地址时置空字符串。
+    if SYNOLOGY_WEB_BASE:
+        folder_path = "/" + str(Path(nas_path).parent).replace("\\", "/") + "/"
+        double_encoded_folder = urllib.parse.quote(urllib.parse.quote(folder_path, safe=""), safe="")
+        synology_web_url = f"{SYNOLOGY_WEB_BASE}/index.cgi?launchApp=SYNO.SDS.App.FileStation3.Instance&launchParam=openfile%3D{double_encoded_folder}"
+    else:
+        synology_web_url = ""
+    full_nas_uri = f"{NAS_HOST}/{nas_path}" if NAS_HOST else ""
     return {
         "rank": rank,
         "score": round(score, 4),
@@ -223,7 +232,7 @@ def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any
         "resolution": "1080P",
         "frame_image_url": f"/api/frames/{filename}",
         "nas_path": nas_path,
-        "full_nas_uri": f"{NAS_HOST}/{nas_path}",
+        "full_nas_uri": full_nas_uri,
         "synology_web_url": synology_web_url,
     }
 
@@ -286,7 +295,7 @@ def decode_base64_image(s: str) -> bytes:
 
 
 def search_by_embedding(vec, k_want: int, label: str) -> dict[str, Any]:
-    """共用检索：特征向量 -> 前端平台契约响应体（文本/以图搜图共用）。
+    """共用检索：特征向量 -> 前端契约响应体（文本/以图搜图共用）。
 
     vec: 1xD 或 D 维向量（list / numpy 均可）；label: 响应 data.query。
     """
@@ -328,9 +337,9 @@ def search_by_embedding(vec, k_want: int, label: str) -> dict[str, Any]:
 # ---------- FastAPI ----------
 
 class SearchRequest(BaseModel):
-    """POST /api/search 请求体（对齐前端平台 shared/api.interface.ts）。
+    """POST /api/search 请求体（对齐前端 shared/api.interface.ts）。
 
-    前端平台前端可能额外带 filter 等字段：extra=ignore 直接丢弃，保证向前兼容。
+    前端可能额外带 filter 等字段：extra=ignore 直接丢弃，保证向前兼容。
     """
 
     model_config = {"extra": "ignore", "populate_by_name": True}
@@ -344,7 +353,7 @@ class SearchRequest(BaseModel):
 app = FastAPI(title="视频检索 API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 平台前端平台网页直接跨域调用
+    allow_origins=["*"],  # Web 前端直接跨域调用
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -518,6 +527,8 @@ def main() -> int:
     print(f"[api] db={APP_DB} collection={APP_COLLECTION} "
           f"frames_dirs={APP_FRAMES_DIRS} model={APP_MODEL or 'auto'} "
           f"translate={APP_TRANSLATE}")
+    print(f"[config] site.json: nas={'on' if (NAS_HOST or NAS_PREFIX or NAS_PATH_MAP) else 'off'}, "
+          f"path_map={len(NAS_PATH_MAP)}")
     if not APP_FRAMES_DIRS:
         print("[warn] 未找到帧图片目录，/api/frames 将全部 404")
 

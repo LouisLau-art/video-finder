@@ -49,13 +49,16 @@ except ImportError as e:  # noqa: BLE001 — 缺依赖时给安装提示而非�
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# 默认探测顺序：中文原生 cnclip 索引优先，其次本地 chroma_db
+# 默认探测顺序：全量索引库（index_full/cnclip）优先，其次评测库，最后本地 chroma_db
 DEFAULT_DB_CANDIDATES = [
+    "data/local-runtime/index_full/cnclip",
     "data/local-runtime/eval_chroma/cnclip",
     "chroma_db",
 ]
-# 帧图片目录探测顺序
+# 帧图片目录探测顺序：全量帧目录优先（10 万帧规模下 find_frame_file 仍是逐目录
+# 直接 join + stat，不做整目录扫描，故不随帧数退化；旧目录保留做兼容兜底）
 DEFAULT_FRAMES_CANDIDATES = [
+    "data/local-runtime/frames_full",
     "data/local-runtime/brand2_frames",
     "frames",
 ]
@@ -194,8 +197,14 @@ def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any
     frame_path = str(meta.get("frame_path", ""))
     filename = Path(frame_path).name
 
-    # 优先查真实 NAS 完整全路径映射，无映射则兜底拼一级目录
-    nas_path = NAS_PATH_MAP.get(video_id, f"{NAS_PREFIX}/{video_name}")
+    # NAS 路径：全量索引的 metadata 自带 share+relpath 时直拼最准；
+    # 旧评测库无该字段，走真实路径映射表；最后兜底拼一级目录。
+    share = str(meta.get("share") or "")
+    relpath = str(meta.get("relpath") or "")
+    if share and relpath:
+        nas_path = f"{share}/{relpath}"
+    else:
+        nas_path = NAS_PATH_MAP.get(video_id, f"{NAS_PREFIX}/{video_name}")
 
     # 群晖 DSM 标准深链协议：直接拉起 File Station 并自动定位展开所在文件夹
     # 路径需为双重 URL 编码（%252F...），且定位到所在文件夹（带末尾斜杠）

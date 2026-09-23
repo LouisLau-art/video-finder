@@ -184,7 +184,12 @@ def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any
 
     # 优先查真实 NAS 完整全路径映射，无映射则兜底拼一级目录
     nas_path = NAS_PATH_MAP.get(video_id, f"{NAS_PREFIX}/{video_name}")
-    synology_web_url = f"{SYNOLOGY_WEB_BASE}/#{urllib.parse.quote('/' + nas_path)}"
+
+    # 群晖 DSM 标准深链协议：直接拉起 File Station 并自动定位展开所在文件夹
+    # 路径需为双重 URL 编码（%252F...），且定位到所在文件夹（带末尾斜杠）
+    folder_path = "/" + str(Path(nas_path).parent).replace("\\", "/") + "/"
+    double_encoded_folder = urllib.parse.quote(urllib.parse.quote(folder_path, safe=""), safe="")
+    synology_web_url = f"{SYNOLOGY_WEB_BASE}/index.cgi?launchApp=SYNO.SDS.App.FileStation3.Instance&launchParam=openfile%3D{double_encoded_folder}"
     return {
         "rank": rank,
         "score": round(score, 4),

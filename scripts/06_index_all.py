@@ -90,6 +90,9 @@ DEFAULT_FRAMES_DIR = "data/local-runtime/frames_full"
 DEFAULT_DB = "data/local-runtime/index_full"
 DEFAULT_COLLECTION = "frames"
 
+# 连续 0 帧/失败熔断阈值（疑似 NAS 掉线时中止，避免空转写脏 state）
+MAX_CONSECUTIVE_EMPTY = 20
+
 
 # ---------- 发现 ----------
 
@@ -159,6 +162,34 @@ def video_key_of(share: str, relpath: str) -> str:
     return hashlib.md5(f"{share}/{relpath}".encode("utf-8")).hexdigest()[:8]
 
 
+def check_roots_readable(roots: list[str]) -> list[str]:
+    """启动前置检查：每个 --roots 根目录必须可读且非空。
+
+    返回错误信息列表（空表示全过）。NAS 掉线时挂载点常表现为：
+    不存在 / 不可列目录 / 空目录，任一命中都应拒绝开工，避免空转写脏 state。
+    """
+    errs: list[str] = []
+    for root in roots:
+        p = Path(root)
+        if not p.is_dir():
+            errs.append(
+                f"[error] 根目录不可用: {root}（不存在或不是目录）。"
+                "NAS 可能未挂载，请先运行 scripts/mount_nas.sh 确认挂载后再跑。")
+            continue
+        try:
+            entries = os.listdir(root)
+        except OSError as e:
+            errs.append(
+                f"[error] 根目录不可读: {root}（{type(e).__name__}: {e}）。"
+                "可能是 NAS 掉线/权限丢失，请先运行 scripts/mount_nas.sh 确认挂载后再跑。")
+            continue
+        if not entries:
+            errs.append(
+                f"[error] 根目录为空: {root}（列目录成功但无任何条目）。"
+                "NAS 可能未挂载或挂载点被遮挡，请先运行 scripts/mount_nas.sh 确认挂载后再跑。")
+    return errs
+
+
 # ---------- worker（抽帧，只在子进程跑；模块动态加载，避免 pickle 传模块对象） ----------
 
 
@@ -209,6 +240,18 @@ def _extract_job(job: dict) -> dict:
                          "frame_path": str(dst.as_posix()), "time": t})
         rows.sort(key=lambda x: x["time"])
         shutil.rmtree(staging, ignore_errors=True)
+        if not rows:
+            # 0 帧时轻量探测：区分「真无画面」与「文件不可读（NAS 抖动/掉线）」。
+            # stat 失败 -> 记 failed（续跑自动重试，不污染 state）；
+            # stat 正常 -> 真无画面，保持 done+0帧，并打 empty_confirmed 供续跑跳过。
+            try:
+                os.stat(job["video_path"])
+            except OSError as e:
+                return {"video_key": vkey, "ok": False,
+                        "error": f"unreadable: {type(e).__name__}: {e}",
+                        "rows": [], "frames": 0}
+            return {"video_key": vkey, "ok": True, "rows": rows, "frames": 0,
+                    "empty_confirmed": True}
         return {"video_key": vkey, "ok": True, "rows": rows, "frames": len(rows)}
     except Exception as e:  # noqa: BLE001 — 单视频异常由主进程记 failed，不中断
         shutil.rmtree(staging, ignore_errors=True)
@@ -296,6 +339,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个（体积升序，小样验证用）")
     ap.add_argument("--dry-run", action="store_true", help="只打印统计，不写盘")
     ap.add_argument("--force", action="store_true", help="忽略断点状态，全部重跑")
+    ap.add_argument("--max-consecutive-empty", type=int, default=MAX_CONSECUTIVE_EMPTY,
+                    help="连续 0 帧/失败达到该数即熔断停机（疑似 NAS 掉线），默认 20")
     # 以下为管线必需但任务未列出的配套旋钮（均取与现有脚本一致的默认值）：
     ap.add_argument("--model", default="cnclip",
                     choices=["siglip2", "cnclip", "openclip", "dummy"])
@@ -307,6 +352,13 @@ def main() -> int:
     frames_dir = Path(args.frames_dir)
     manifest = Path(args.manifest) if args.manifest else frames_dir / "manifest.jsonl"
     db_dir = Path(args.db)
+
+    # 启动前置检查（dry-run 同样执行：它也要遍历目录，根不可用时直接退出）。
+    root_errs = check_roots_readable(args.roots)
+    if root_errs:
+        for e in root_errs:
+            print(e, file=sys.stderr)
+        return 1
 
     t_start = time.time()
     videos = discover_videos(args.roots, args.include_dir, args.exclude_dir,
@@ -370,6 +422,14 @@ def main() -> int:
         if st and st.get("status") == "done" and not st.get("pending_upsert") \
                 and not args.force:
             names = st.get("frames") or []
+            if not names:
+                # 0 帧 done 默认重跑（all([])==True 会永久跳过，此处显式规避）；
+                # 只有打了 empty_confirmed（真无画面）才跳过，避免无限重试纯色卡视频。
+                if st.get("empty_confirmed"):
+                    n_skip += 1
+                    continue
+                todo.append(v)
+                continue
             if all((frames_dir / n).is_file() for n in names):
                 n_skip += 1
                 skip_frames += len(names)
@@ -467,6 +527,11 @@ def main() -> int:
     cum_frames = 0
     pending: list[tuple[str, list[dict]]] = []
     pending_frames = 0
+    # 连续 0 帧/失败计数（按 imap 返回顺序统计）：成功（frames>0）即清零，
+    # 达到阈值即判定疑似 NAS 掉线，熔断停机。
+    consecutive_empty = 0
+    fused = False
+    max_empty = max(int(args.max_consecutive_empty), 1)
     t0 = time.time()
     workers = max(int(args.workers), 1)
     with Pool(workers, initializer=_worker_init, initargs=(args.nice,)) as pool:
@@ -488,6 +553,9 @@ def main() -> int:
                         state[k] = {"status": "done", "mtime": vv["mtime"],
                                     "size": vv["size"],
                                     "frames": [Path(r["frame_path"]).name for r in krows]}
+                        if not krows:
+                            # 真无画面（worker 已 stat 确认）：打标，续跑可跳过
+                            state[k]["empty_confirmed"] = True
                     save_state(db_dir, state)
                     pending = []
                     pending_frames = 0
@@ -497,13 +565,21 @@ def main() -> int:
                     state[vkey] = {"status": "done", "mtime": v["mtime"], "size": v["size"],
                                    "frames": [Path(r["frame_path"]).name for r in rows],
                                    "pending_upsert": True}
+                    if not rows:
+                        state[vkey]["empty_confirmed"] = True
                     save_state(db_dir, state)
                 n_done += 1
+                # 熔断计数：真无画面（0 帧）与失败同等计入，成功（>0 帧）清零
+                if res.get("frames", 0) > 0:
+                    consecutive_empty = 0
+                else:
+                    consecutive_empty += 1
             else:
                 state[vkey] = {"status": "failed", "mtime": v["mtime"], "size": v["size"],
                                "frames": [], "error": res.get("error", "unknown")}
                 save_state(db_dir, state)
                 n_failed += 1
+                consecutive_empty += 1
             el = time.time() - t0
             rate = cum_frames / el if el > 0 else 0.0
             avg_per_vid = cum_frames / max(done_idx, 1)
@@ -515,6 +591,15 @@ def main() -> int:
                   f"{rate:.1f}帧/秒 预计剩余{eta_s}"
                   + ("" if res.get("ok") else f" [FAILED] {res.get('error')}"),
                   flush=True)
+            if consecutive_empty >= max_empty:
+                print(f"[FUSE] 连续 {consecutive_empty} 个视频 0 帧/失败，"
+                      "疑似 NAS 掉线或后端存储不可用，已中止提交新任务。",
+                      file=sys.stderr, flush=True)
+                print(f"[FUSE] state 已保存（done={n_done} failed={n_failed}），"
+                      "确认 NAS 挂载恢复后直接重跑本命令即可续跑。",
+                      file=sys.stderr, flush=True)
+                fused = True
+                break
     # 尾批（不足一批的剩余帧）：成功则去掉 pending_upsert 转正，失败已在内部记 failed
     if pending:
         _ok_frames, ok_keys = flush_batch(pending)
@@ -524,6 +609,8 @@ def main() -> int:
                 vv = by_key[k]
                 state[k] = {"status": "done", "mtime": vv["mtime"], "size": vv["size"],
                             "frames": [Path(r["frame_path"]).name for r in krows]}
+                if not krows:
+                    state[k]["empty_confirmed"] = True
         save_state(db_dir, state)
     if man_f:
         man_f.close()
@@ -539,6 +626,8 @@ def main() -> int:
           f"帧数={cum_frames}(+跳过{skip_frames}) 耗时={el / 60:.1f}分 平均帧速={rate:.1f}帧/秒")
     print(f"[summary] 帧->{frames_dir} manifest->{manifest} "
           f"chroma->{chroma_path} collection={args.collection}")
+    if fused:
+        return 3
     return 0 if n_failed == 0 else 2
 
 

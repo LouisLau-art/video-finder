@@ -183,7 +183,7 @@ class _StubTranslator:
 
 
 def test_has_cjk_detection():
-    assert m03.has_cjk("红色背心") is True
+    assert m03.has_cjk("清晨薄雾") is True
     assert m03.has_cjk("红色 vest") is True
     assert m03.has_cjk("red vest") is False
     assert m03.has_cjk("123 !@#") is False
@@ -207,10 +207,10 @@ def test_resolve_query_no_cjk_skips_injected_translator():
 
 def test_resolve_query_cjk_uses_translator():
     stub = _StubTranslator(out="red vest")
-    q, tr = m03.resolve_query("红色背心", translator=stub)
+    q, tr = m03.resolve_query("清晨薄雾", translator=stub)
     assert q == "red vest"
     assert tr == "red vest"
-    assert stub.calls == ["红色背心"]
+    assert stub.calls == ["清晨薄雾"]
 
 
 def test_resolve_query_cjk_translator_none_falls_back_zh2en():
@@ -329,8 +329,8 @@ def test_siglip2_encode_texts_uses_max_length_padding():
 def test_resolve_query_for_encoder_cnclip_raw_no_translator():
     # cnclip 中文原生: 原样返回, 即使注入了翻译桩也绝不调用
     bomb = _StubTranslator(error=RuntimeError("不应被调用"))
-    q, tr = m03.resolve_query_for_encoder("红色背心", "cnclip", translator=bomb)
-    assert (q, tr) == ("红色背心", None)
+    q, tr = m03.resolve_query_for_encoder("清晨薄雾", "cnclip", translator=bomb)
+    assert (q, tr) == ("清晨薄雾", None)
     assert bomb.calls == []
 
 
@@ -338,8 +338,8 @@ def test_resolve_query_for_encoder_cnclip_never_lazy_loads(monkeypatch):
     # cnclip 默认路径也不得触碰懒加载翻译器
     called: list[str] = []
     monkeypatch.setattr(m03, "ZhEnTranslator", lambda: called.append("load"))
-    q, tr = m03.resolve_query_for_encoder("红色背心", "cnclip")
-    assert (q, tr) == ("红色背心", None)
+    q, tr = m03.resolve_query_for_encoder("清晨薄雾", "cnclip")
+    assert (q, tr) == ("清晨薄雾", None)
     assert called == []
 
 
@@ -352,16 +352,16 @@ def test_resolve_query_for_encoder_cnclip_mixed_text_unchanged():
 def test_resolve_query_for_encoder_siglip2_default_no_translate():
     # 默认中文直查: 只过 ZH2EN 映射, 不触碰翻译器(评测: 短中文查询直查更优)
     bomb = _StubTranslator(error=RuntimeError("不应被调用"))
-    q, tr = m03.resolve_query_for_encoder("红色背心", "siglip2", translator=bomb)
-    assert (q, tr) == ("红色背心", None)
+    q, tr = m03.resolve_query_for_encoder("清晨薄雾", "siglip2", translator=bomb)
+    assert (q, tr) == ("清晨薄雾", None)
     assert bomb.calls == []
 
 
 def test_resolve_query_for_encoder_siglip2_translate_flag():
     stub = _StubTranslator(out="red vest")
-    q, tr = m03.resolve_query_for_encoder("红色背心", "siglip2", translator=stub, translate=True)
+    q, tr = m03.resolve_query_for_encoder("清晨薄雾", "siglip2", translator=stub, translate=True)
     assert (q, tr) == ("red vest", "red vest")
-    assert stub.calls == ["红色背心"]
+    assert stub.calls == ["清晨薄雾"]
 
 
 def test_resolve_query_for_encoder_openclip_translate_flag():
@@ -404,9 +404,9 @@ def test_cnclip_encode_texts_padding_truncation_and_norm():
     enc = object.__new__(m02.CnClipEncoder)
     enc.processor = _FakeProcessor()
     enc.model = _FakeModel()
-    out = enc.encode_texts(["红色背心", "运动上装"])
+    out = enc.encode_texts(["清晨薄雾", "山间小径"])
     assert calls == [{
-        "text": ["红色背心", "运动上装"], "return_tensors": "pt",
+        "text": ["清晨薄雾", "山间小径"], "return_tensors": "pt",
         "padding": True, "truncation": True,
     }]
     assert out.shape == (2, 4)
@@ -488,7 +488,7 @@ def test_preprocess_translate_mode_passes_translator_and_flag():
             return "red vest", "RED VEST"
 
     stub_m3 = _M3()
-    q, tr = m04.preprocess_for_mode(stub_m3, "红色背心", "siglip2", "translate")
+    q, tr = m04.preprocess_for_mode(stub_m3, "清晨薄雾", "siglip2", "translate")
     assert (q, tr) == ("red vest", "RED VEST")
     assert stub_m3.calls is not None
     assert isinstance(stub_m3.calls["translator"], _EvalTranslatorStub)
@@ -502,7 +502,7 @@ def test_preprocess_translate_mode_raises_when_model_unavailable():
             return None
 
     with pytest.raises(RuntimeError):
-        m04.preprocess_for_mode(_M3(), "红色背心", "siglip2", "translate")
+        m04.preprocess_for_mode(_M3(), "清晨薄雾", "siglip2", "translate")
 
 
 # ---------- 可选：DummyEncoder + chromadb 最小链路 ----------

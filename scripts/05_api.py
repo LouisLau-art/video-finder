@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,31 @@ DEFAULT_FRAMES_CANDIDATES = [
 
 NAS_PREFIX = "share-a/0video"
 NAS_HOST = "smb://nas.example.invalid"
+SYNOLOGY_WEB_BASE = "http://nas.example.invalid:5000"
+
+# 真实 NAS 相对路径映射表（从 NAS 真实目录树快照提取，覆盖当前全部 20 个评测素材）
+NAS_PATH_MAP: dict[str, str] = {
+    "clip-redvest": "share-a/0video/clip-redvest.mp4",
+    "race-a": "share-a/0video/品牌/race-a.mp4",
+    "clip-1010": "share-a/0video/品牌/clip-1010.mp4",
+    "clip-story": "share-a/0video/folder-2026/clip-story.mp4",
+    "clip-htc": "share-a/0video/品牌/documentary/clip-htc.mp4",
+    "clip-steady": "share-a/0video/品牌/culture/clip-steady.mp4",
+    "clip-newyear": "share-a/0video/品牌/culture/clip-newyear.mp4",
+    "clip-rotate": "share-a/0video/folder-3d/folder-3d-proj/素材/clip-rotate.mp4",
+    "item-yarn-a": "share-a/0video/products/0.2026/26item-y3D/yarn-item/item-yarn-a.mp4",
+    "item-pants": "share-a/0video/products/0.2026/item-pants/item-pants.mp4",
+    "clip-training-mix": "share-a/0video/products/0.2026/spring-training/clip-training-mix.mp4",
+    "clip-person-a": "share-a/0video/products/0.2026/7月brand-runners-assets/clip-person-a.mp4",
+    "clip-together": "share-a/0video/品牌/culture/folder-expo/screen/clip-together.mp4",
+    "item-cap-a": "share-a/0video/products/0.2026/6.2item-cap/item-cap/item-cap-a.mp4",
+    "item-tee-a": "share-a/0video/products/0.2026/26AW/加厚item-y圆领T恤 升级版/item-tee-a.mp4",
+    "item-vest-a": "share-a/0video/products/0.2026/26AW/dir-vest-a/item-vest-a.mp4",
+    "item-vest-b": "share-a/0video/products/0.2026/26AW/dir-vest-b/item-vest-b.mp4",
+    "item-vest-c": "share-a/0video/products/0.2026/26AW/item-xdir-vest-c2.0/item-vest-c.mp4",
+    "item-coat-a": "share-a/0video/products/0.2026/26AW/item-xdir-coat2.0/item-coat-a.mp4",
+    "item-zip-a": "share-a/0video/products/0.2026/26AW/item-zdir-zip3.0/item-zip-a.mp4",
+}
 
 # 由 main()/--参数写入的运行时配置（ensure_state 懒加载时读取）
 APP_DB = ""
@@ -155,7 +181,10 @@ def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any
     t = float(meta.get("time", 0.0) or 0.0)
     frame_path = str(meta.get("frame_path", ""))
     filename = Path(frame_path).name
-    nas_path = f"{NAS_PREFIX}/{video_name}"
+
+    # 优先查真实 NAS 完整全路径映射，无映射则兜底拼一级目录
+    nas_path = NAS_PATH_MAP.get(video_id, f"{NAS_PREFIX}/{video_name}")
+    synology_web_url = f"{SYNOLOGY_WEB_BASE}/#{urllib.parse.quote('/' + nas_path)}"
     return {
         "rank": rank,
         "score": round(score, 4),
@@ -169,6 +198,7 @@ def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any
         "frame_image_url": f"/api/frames/{filename}",
         "nas_path": nas_path,
         "full_nas_uri": f"{NAS_HOST}/{nas_path}",
+        "synology_web_url": synology_web_url,
     }
 
 

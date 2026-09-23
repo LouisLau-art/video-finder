@@ -5,6 +5,8 @@
 
 接口:
     POST /api/search          文本搜视频帧 (请求体见 SearchRequest)
+    POST /api/search-by-image 以图搜图 (multipart 表单: image 文件 + 可选 query/top_k；
+                              或 JSON: {image_base64, query?, top_k?})
     GET  /api/frames/{name}   帧图片静态预览 (流式返回 jpg)
     GET  /api/health          健康检查 {"status": "ok", "frames_count": N}
 
@@ -25,14 +27,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
+import io
 import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse
     from pydantic import BaseModel, Field
@@ -59,6 +63,11 @@ DEFAULT_FRAMES_CANDIDATES = [
 NAS_PREFIX = "share-a/0video"
 NAS_HOST = "smb://nas.example.invalid"
 SYNOLOGY_WEB_BASE = "http://nas.example.invalid:5000"
+
+# 以图搜图：上传大小上限 15MB；允许的图片后缀；JSON base64 兼容键名
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+IMAGE_BASE64_KEYS = ("image_base64", "imageBase64", "image", "base64")
 
 # 真实 NAS 相对路径映射表（从 NAS 真实目录树快照提取，覆盖当前全部 20 个评测素材）
 NAS_PATH_MAP: dict[str, str] = {
@@ -233,6 +242,77 @@ def count_frames() -> int:
     return total
 
 
+def decode_image_bytes(raw: bytes):
+    """上传字节 -> PIL RGB 图；非法图片抛 ValueError（调用方转 400）。"""
+    from PIL import Image
+
+    if not raw:
+        raise ValueError("图片内容为空")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ValueError(f"图片过大（{len(raw)} 字节），上限 {MAX_IMAGE_BYTES} 字节")
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()  # 提前触发损坏文件报错，避免懒加载漏检
+        return img.convert("RGB")
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"无法解析为图片: {e}")
+
+
+def decode_base64_image(s: str) -> bytes:
+    """兼容 data-URL 前缀的 base64 -> 字节；非法抛 ValueError。"""
+    s = (s or "").strip()
+    if not s:
+        raise ValueError("base64 图片字符串为空")
+    if "," in s and s.startswith("data:"):
+        s = s.split(",", 1)[1]
+    try:
+        return base64.b64decode(s, validate=True)
+    except Exception as e:
+        raise ValueError(f"base64 解码失败: {e}")
+
+
+def search_by_embedding(vec, k_want: int, label: str) -> dict[str, Any]:
+    """共用检索：特征向量 -> 前端平台契约响应体（文本/以图搜图共用）。
+
+    vec: 1xD 或 D 维向量（list / numpy 均可）；label: 响应 data.query。
+    """
+    import numpy as np
+
+    t0 = time.perf_counter()
+    try:
+        _encoder, col = ensure_state()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    arr = np.asarray(vec, dtype=np.float32).reshape(1, -1)
+    k = max(1, min(int(k_want), _CHROMA_COUNT))
+    res = col.query(
+        query_embeddings=arr.tolist(), n_results=k,
+        include=["metadatas", "distances"],
+    )
+    metas = res["metadatas"][0]
+    dists = res["distances"][0]
+
+    results = []
+    for i, (m, d) in enumerate(zip(metas, dists), 1):
+        score = 1.0 - float(d) / 2.0  # chroma cosine distance ∈ [0,2]
+        results.append(build_result(i, score, dict(m)))
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "query": label,
+            "total": len(results),
+            "elapsed_ms": elapsed_ms,
+            "encoder": _ENCODER_NAME,
+            "results": results,
+        },
+    }
+
+
 # ---------- FastAPI ----------
 
 class SearchRequest(BaseModel):
@@ -278,10 +358,10 @@ def search(req: SearchRequest) -> dict[str, Any]:
     if not q:
         raise HTTPException(status_code=400, detail="query 不能为空")
     k_want = req.top_k if req.topk is None else req.topk
+    t_start = time.perf_counter()  # 全链路计时起点（含文本编码）
 
-    t0 = time.perf_counter()
     try:
-        encoder, col = ensure_state()
+        encoder, _col = ensure_state()
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -290,31 +370,112 @@ def search(req: SearchRequest) -> dict[str, Any]:
         q, _ENCODER_NAME, translate=APP_TRANSLATE
     )
     q_emb = encoder.encode_texts([resolved])
-    k = max(1, min(int(k_want), _CHROMA_COUNT))
-    res = col.query(
-        query_embeddings=q_emb.tolist(), n_results=k,
-        include=["metadatas", "distances"],
-    )
-    metas = res["metadatas"][0]
-    dists = res["distances"][0]
+    out = search_by_embedding(q_emb[0], k_want, q)
+    out["data"]["elapsed_ms"] = int((time.perf_counter() - t_start) * 1000)
+    return out
 
-    results = []
-    for i, (m, d) in enumerate(zip(metas, dists), 1):
-        score = 1.0 - float(d) / 2.0  # chroma cosine distance ∈ [0,2]
-        results.append(build_result(i, score, dict(m)))
 
-    elapsed_ms = int((time.perf_counter() - t0) * 1000)
-    return {
-        "code": 0,
-        "message": "success",
-        "data": {
-            "query": q,
-            "total": len(results),
-            "elapsed_ms": elapsed_ms,
-            "encoder": _ENCODER_NAME,
-            "results": results,
-        },
-    }
+def _clamp_top_k(v: Any, default: int) -> int:
+    try:
+        return max(1, min(int(v), 100))
+    except (TypeError, ValueError):
+        return default
+
+
+@app.post("/api/search-by-image")
+async def search_by_image(request: Request) -> dict[str, Any]:
+    """以图搜图：multipart 表单上传优先，JSON base64 兼容。
+
+    A. multipart/form-data: image=<文件 jpg/png/webp/bmp>，
+       query=<可选辅助文字>，top_k=<返回条数，默认 10>。
+    B. application/json: {image_base64|image: <base64，可带 data-URL 前缀>，
+       query?, top_k?}。
+    响应结构与 /api/search 完全一致，data.query 为 "[以图搜图] {filename}"。
+    """
+    ctype = request.headers.get("content-type", "")
+    image_bytes: bytes | None = None
+    filename = "upload"
+    text_hint: str | None = None
+    k_want = 10
+    t_start = time.perf_counter()  # 全链路计时起点（含模型懒加载与图像编码）
+
+    if "multipart" in ctype:
+        try:
+            form = await request.form()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"表单解析失败: {e}")
+        upload = form.get("image")
+        if upload is None:
+            raise HTTPException(status_code=400, detail="缺少 image 文件字段")
+        filename = getattr(upload, "filename", None) or "upload"
+        try:
+            image_bytes = await upload.read()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"读取上传文件失败: {e}")
+        hint = form.get("query")
+        if hint is not None:
+            text_hint = str(hint).strip() or None
+        if form.get("top_k") is not None:
+            k_want = _clamp_top_k(form.get("top_k"), 10)
+        elif form.get("topk") is not None:
+            k_want = _clamp_top_k(form.get("topk"), 10)
+    elif "json" in ctype:
+        try:
+            body = await request.json()
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"JSON 解析失败: {e}")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="JSON 请求体必须为对象")
+        b64 = next((body.get(k) for k in IMAGE_BASE64_KEYS if body.get(k)), None)
+        if b64 is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"缺少图片字段（任一: {', '.join(IMAGE_BASE64_KEYS)}）",
+            )
+        try:
+            image_bytes = decode_base64_image(str(b64))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        filename = str(body.get("filename") or body.get("name") or "upload")
+        hint = body.get("query") or body.get("text")
+        if hint is not None:
+            text_hint = str(hint).strip() or None
+        k_want = _clamp_top_k(body.get("top_k", body.get("topk", 10)), 10)
+    else:
+        raise HTTPException(
+            status_code=415,
+            detail="Content-Type 须为 multipart/form-data（image 文件上传）"
+                   "或 application/json（image_base64）",
+        )
+
+    if image_bytes is None:
+        raise HTTPException(status_code=400, detail="未收到图片数据")
+    suffix = Path(filename).suffix.lower()
+    if suffix and suffix not in ALLOWED_IMAGE_SUFFIXES:
+        print(f"[api][warn] 以图搜图非常规后缀 {suffix!r}（文件 {filename!r}），仍尝试解码")
+    try:
+        img = decode_image_bytes(image_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        _encoder, _col = ensure_state()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if not hasattr(_encoder, "encode_images"):
+        raise HTTPException(
+            status_code=500, detail=f"当前 encoder（{_ENCODER_NAME}）不支持图像编码"
+        )
+    img_emb = _encoder.encode_images([img])
+
+    label = f"[以图搜图] {Path(filename).name}"
+    if text_hint:
+        # 可选辅助文字：仅日志记录 + 拼入 query 标签，不改变图像检索语义
+        print(f"[api] 以图搜图附带文字: {text_hint!r}")
+        label += f" + {text_hint}"
+    out = search_by_embedding(img_emb[0], k_want, label)
+    out["data"]["elapsed_ms"] = int((time.perf_counter() - t_start) * 1000)
+    return out
 
 
 def main() -> int:

@@ -254,7 +254,7 @@ video-finder/
 │   ├── mount_nas.sh      # 幂等挂载网络共享（凭证外置）
 │   └── keep_tunnel.sh    # 服务与反向隧道保活（凭证外置）
 ├── tests/test_smoke.py   # 48 项冒烟测试
-├── docs/                 # 前后端接口契约与页面规格
+├── docs/                 # 站点配置示例（site.example.json）
 ├── pyproject.toml
 ├── LICENSE               # MIT
 └── README.md

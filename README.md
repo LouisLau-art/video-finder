@@ -1,62 +1,70 @@
-# video-finder · 视频搜索（文本搜视频帧，单机 CPU 原型）
+# video-finder · 视频语义检索（文本 / 图片搜视频帧）
 
 ![Python 3.14](https://img.shields.io/badge/Python-3.14-blue?logo=python&logoColor=white)
 ![License MIT](https://img.shields.io/badge/License-MIT-green)
 ![Platform Linux](https://img.shields.io/badge/Platform-Linux-lightgrey?logo=linux&logoColor=white)
 ![Chroma](https://img.shields.io/badge/VectorDB-Chroma-orange)
-![SigLIP2](https://img.shields.io/badge/Encoder-SigLIP2-purple)
+![CN-CLIP](https://img.shields.io/badge/Encoder-CN--CLIP-purple)
+![FastAPI](https://img.shields.io/badge/Service-FastAPI-009688)
 
-> 一句话：给一堆本地 mp4，一句文本（中/英文）就能找回 **文件名 + 秒数 + 截图（帧路径）**。
+> 一句话：给一堆本地视频，输入一句中文/英文描述，或直接上传一张参考图，就能找回 **文件名 + 秒数 + 关键帧截图**。
 
-本仓库是在 Arch Linux 无独显机器上验证通的最小链路：只用 `uv` + 本地 `Chroma`，不依赖 Docker、不调付费 API。
+单机 CPU 可跑（无独显、无 Docker、不调付费 API）：`uv` + `ffmpeg` + `Chroma` + `CN-CLIP / SigLIP2` + `FastAPI`。
+设计目标是从 10 个视频的验证集平滑扩展到 **数千个 视频 / 数百 GB+ 素材库**。
 
-## 功能特性
+## 核心能力
 
-- **文本搜帧**：英文自然描述（如 `white tent lawn black man`）按相似度排序返回帧。
-- **中文查询**：默认中文直查（评测：短中文查询优于翻译，且省 ~4s/查询）；`--translate` 可启用本地翻译模型 `Helsinki-NLP/opus-mt-zh-en`（懒加载，CPU，失败/离线回退关键词映射表）。
-- **场景优先抽帧**：优先 PySceneDetect `ContentDetector` 按场景切分，每场景留 1–3 个中间帧；切不出/报错自动回退纯 1fps，不中断。
-- **黑场/纯色卡过滤**：抽帧后丢弃片头尾黑场、纯色卡帧（灰度均值 < 8 或标准差 < 6），不写 manifest，避免污染检索 top1。
-- **Encoder 组合**：`SigLIP2（google/siglip2-base-patch16-224）→ open_clip ViT-B/32（laion2b_s34b_b79k）→ dummy 哈希（仅保链路）` 自动回退；另可显式 `--model cnclip` 用中文原生 `OFA-Sys/chinese-clip-vit-base-patch16`（评测：中文查询 hit@5 最高、查询延迟最低）。实际用哪个会写进 `chroma_db/encoder.json`，查询时自动对齐，保证图文同一向量空间。
-- **本地持久化**：向量存 `chroma_db/`（cosine 空间），payload 含 `video_id / time / frame_path`，拿着 `frame_path` 直接打开 jpg 就是截图，`video_id + time` 可回跳原视频对应秒数。
-- **CPU 友好**：默认 `--batch-size 4`，小内存可用 `--batch-size 2`。
+- **中文文本搜帧**：自然语言直查，如「夜跑 红色背心 冲刺」「yarn-item特写 纺织细节」「白色item-cap」，返回视频级排名 + 命中秒数 + 关键帧图。
+- **以图搜图**：上传 / 拖拽一张参考图（或 base64 JSON），不用任何文字，直接按画面特征检索到相同镜头；实测命中原视频同时刻帧相似度 100%。
+- **场景感知抽帧**：PySceneDetect 场景切分、每场景取 1–3 个中间帧，切不出自动回退纯 1fps；片头尾黑场 / 纯色卡自动过滤，避免污染 top1。
+- **多 encoder 可插拔 + 自动对齐**：`SigLIP2 → open_clip → dummy` 自动回退，可选中文原生 `CN-CLIP`；实际 encoder 写入索引元数据，查询时自动配对，保证图文同一向量空间。
+- **视频级评测体系**：hit@1/5/10 + MRR，多配置横向对比（翻译层 / 中文直查 / 中文原生），结果落 JSON 报告。
+- **REST 服务化**：FastAPI 暴露文本检索、图片检索、关键帧图、健康检查 4 个端点，开箱跨域，供 Web / 机器人直接调用。
+- **全量索引管线**：NAS(SMB) 直读零拷贝、多进程并行抽帧、**断点续跑**、增量 upsert、`nice` 限速后台跑，10 万帧级索引无人值守。
+- **工程细节**：凭证外置（配置文件 600 权限，绝不进仓库）、帧级全局唯一命名防撞名、评测集与生产索引物理隔离、单文件异常不中断整批。
 
-## 架构链路
+## 架构
+
+```text
+视频库 (本地磁盘 / SMB 网络共享 / NAS)
+  │
+  ▼  06_index_all.py ── 全量索引管线（并行 + 断点续跑 + 限速）
+  │     发现 → 抽帧(01) → 编码(CN-CLIP) → 批量 upsert
+  │
+  ├─▶ frames_full/*.jpg            关键帧落盘（含黑场过滤）
+  ├─▶ frames_full/manifest.jsonl   帧级明细（video_key/share/relpath/time）
+  └─▶ index_full/cnclip/           Chroma 向量库（cosine，帧级向量）
+        + state.json               断点状态（done/failed/skip）
+  │
+  ▼  05_api.py ── FastAPI 检索服务
+  │     POST /api/search            文本 → 编码 → 向量检索
+  │     POST /api/search-by-image   图片 → 图像编码 → 向量检索（multipart / base64）
+  │     GET  /api/frames/{name}     关键帧预览图
+  │     GET  /api/health            健康检查 {"status":"ok","frames_count":N}
+  ▼
+调用方（Web 前端 / 聊天机器人 / CLI 03_search.py）
+```
+
+单机链路（最小验证集即可跑通）：
 
 ```text
 mp4 (videos_sample/)
-  │
-  ▼
-ffmpeg 抽帧 ──优先──▶ PySceneDetect 场景切分 (每场景 1–3 中帧)
-  │                    ──失败──▶ 回退纯 1fps
-  ▼
-frames/{video_id}_{ss}.jpg + frames/manifest.jsonl
-(video_id / time / frame_path / video_path)
-  │
-  ▼
-embedding (CPU)
-  SigLIP2 → open_clip ViT-B/32 → dummy哈希(兜底)
-  │
-  ▼
-Chroma 本地索引 (chroma_db/, collection=frames, hnsw:space=cosine)
-  + chroma_db/encoder.json (记录实际 encoder)
-  │
-  ▼
-查询: 文本 → 中文直查(可选 --translate 翻译, 失败回退关键词映射) → 同一 encoder 编码 → Chroma query
-  → 排序输出 rank / score / dist / video_id / time / frame_path
+  → ffmpeg 抽帧（优先场景切分，失败回退 1fps，黑场过滤）
+  → frames/{video_id}_{ss}.jpg + manifest.jsonl
+  → embedding (CPU, batch)
+  → Chroma 本地索引 chroma_db/ + encoder.json（记录实际 encoder）
+  → 查询：文本/图片 → 同一 encoder 编码 → 余弦距离 → rank/score/video_id/time/frame_path
 ```
 
 ## 快速开始
 
-环境：Arch Linux / Python 3.14（`.python-version` 已锁定）/ `uv` / `ffmpeg + ffprobe`，无 N 卡、无 Docker。
+环境：Arch Linux / Python 3.14（`.python-version` 已锁定）/ `uv` / `ffmpeg + ffprobe`，无独显可跑。
 
 ```bash
-cd video-finder   # 或 video-finder-prototype（本地旧目录名）
+# 1) 建 venv
+uv venv && source .venv/bin/activate
 
-# 1) 建 venv（uv 会按 .python-version 用 python3.14）
-uv venv
-source .venv/bin/activate
-
-# 2) 先装 CPU 版 torch + torchvision（重要！直接装默认轮子会混进 CUDA 版
+# 2) 先装 CPU 版 torch + torchvision（重要！默认轮子会混进 CUDA 版
 #    torchvision，导致 open_clip/transformers 报 torchvision::nms does not exist）
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
@@ -64,11 +72,21 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cp
 uv pip install -e .
 
 # 4) 确认 ffmpeg / ffprobe
-ffmpeg -version | head -n 1
-ffprobe -version | head -n 1
+ffmpeg -version | head -n 1 && ffprobe -version | head -n 1
 ```
 
-三步跑通（命令与参数均与 `scripts/` 实际实现一致）：
+最小验证（1 个 5 秒合成视频，无需真实素材）：
+
+```bash
+# 生成假视频
+ffmpeg -y -f lavfi -i "testsrc=duration=5:size=640x360:rate=30" videos_sample/fake_test.mp4
+
+python scripts/01_extract.py                 # 抽帧
+python scripts/02_embed_index.py --batch-size 2   # 建索引
+python scripts/03_search.py "white tent lawn" --topk 5   # 查询
+```
+
+真实素材三步走（与 `scripts/` 实现一致）：
 
 ```bash
 # 0) 放视频（先 10–20 个，别一上来就全量）
@@ -76,116 +94,111 @@ cp /path/to/*.mp4 videos_sample/
 
 # 1) 抽帧：优先场景切分（每场景 1–3 中帧），失败回退纯 1fps
 python scripts/01_extract.py
-# 输出：frames/{video_id}_{ss}.jpg + frames/manifest.jsonl（含 video_id,time,frame_path）
-# 可选参数：--input-dir videos_sample --frames-dir frames
-#           --manifest frames/manifest.jsonl --fps 1.0 --max-per-scene 3
+# 可选：--input-dir videos_sample --frames-dir frames
+#       --manifest frames/manifest.jsonl --fps 1.0 --max-per-scene 3
 
-# 2) embedding + 建索引（CPU 小 batch，默认 4）
+# 2) embedding + 建索引（CPU 小 batch）
 python scripts/02_embed_index.py
-# 可选参数：--manifest frames/manifest.jsonl --db chroma_db --collection frames
-#           --batch-size 4 --model siglip2|cnclip|openclip|dummy --rebuild
-#   --batch-size 2 更省内存 / --rebuild 重建索引 / --model 强制指定 encoder（cnclip 为中文原生）
-# 输出：chroma_db/（本地持久化）+ chroma_db/encoder.json
+# 可选：--manifest frames/manifest.jsonl --db chroma_db --collection frames
+#       --batch-size 4 --model siglip2|cnclip|openclip|dummy --rebuild
 
 # 3) 查
-python scripts/03_search.py "white tent lawn" --topk 20
-python scripts/03_search.py "white tent lawn black man" --topk 20
 python scripts/03_search.py "白色帐篷 草坪" --topk 10
-# 03 可选参数：--db chroma_db --collection frames
-#             --model siglip2|cnclip|openclip|dummy（默认读 encoder.json自动对齐）
-#             --translate（启用 opus-mt 翻译层，默认直查）
-#             --topk 20（默认 20）
+# 可选：--db chroma_db --model siglip2|cnclip|openclip|dummy
+#       --translate（启用 opus-mt 翻译层，默认直查） --topk 20
 ```
 
-最小验证（1 个 5 秒假视频，无需准备真实素材）：
+## 检索服务 API（`scripts/05_api.py`）
 
 ```bash
-# 生成 5 秒测试视频
-ffmpeg -y -f lavfi -i "testsrc=duration=5:size=640x360:rate=30" videos_sample/fake_test.mp4
-
-python scripts/01_extract.py
-python scripts/02_embed_index.py --batch-size 2
-python scripts/03_search.py "white tent lawn" --topk 5
-python scripts/03_search.py --help
+uv run python scripts/05_api.py --port 8000
+# 默认按顺序探测索引：全量索引库 → 评测库 → chroma_db
+# 显式指定：--db data/local-runtime/index_full/cnclip --port 8000
 ```
-
-## 查询示例
-
-英文查询（推荐，语义最准）：
 
 ```bash
-python scripts/03_search.py "white tent lawn" --topk 20
-python scripts/03_search.py "white tent lawn black man" --topk 20
+# 健康检查
+curl http://127.0.0.1:8000/api/health
+# → {"status":"ok","frames_count":636}
+
+# 文本搜帧
+curl -X POST http://127.0.0.1:8000/api/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"夜跑 红色背心 冲刺","top_k":5}'
+
+# 以图搜图（multipart 上传）
+curl -F "image=@frame.jpg" -F "top_k=3" \
+  http://127.0.0.1:8000/api/search-by-image
+
+# 以图搜图（base64 JSON，前端压缩后常用）
+curl -X POST http://127.0.0.1:8000/api/search-by-image \
+  -H 'Content-Type: application/json' \
+  -d '{"image_base64":"data:image/jpeg;base64,...","top_k":3}'
 ```
 
-中文查询（默认直查；`--translate` 可选翻译层）：
+统一响应结构：
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "query": "夜跑 红色背心 冲刺",
+    "total": 5,
+    "elapsed_ms": 82,
+    "encoder": "cnclip",
+    "results": [
+      {
+        "rank": 1,
+        "score": 0.71,
+        "match_percentage": "71%",
+        "video_id": "demo_clip",
+        "video_name": "demo_clip.mp4",
+        "time_seconds": 35.4,
+        "time_formatted": "00:35.4",
+        "frame_image_url": "/api/frames/demo_clip_35.4.jpg",
+        "nas_path": "share/folder/demo_clip.mp4"
+      }
+    ]
+  }
+}
+```
+
+> 图片上传限制：常规后缀直通，非标准后缀告警放行；15MB 上限；坏图 / 缺字段 / 不支持的类型分别返回 400 / 415。
+
+## 全量索引管线（`scripts/06_index_all.py`）
+
+面向几千个视频的无人值守索引：**NAS 直读、不需要先下载视频**（实测 SMB 顺序读 60MB/s，4K 素材流式抽帧 ≈ 2.3× 实时速度）。
 
 ```bash
-python scripts/03_search.py "白色帐篷 草坪" --topk 10              # 直查（默认）
-python scripts/03_search.py "白色帐篷 草坪" --topk 10 --translate  # opus-mt 翻译后再编码
-```
-- 直查打印：`[query] 映射: '白色帐篷 草坪' -> 'white tent lawn'`（没命中映射词的查询原样直查，如品牌词）
-- `--translate` 打印：`[query] 翻译(zh->en): ...`，失败/离线自动回退 ZH2EN
-- 评测参考（13 视频 × 17 查询，视频级 hit@1/5）：直查 `0.53/0.82` 优于翻译 `0.41/0.71`，故默认关闭翻译；中文原生 encoder `--model cnclip` hit@5 最高（0.88）
+# 0) 挂载网络共享（幂等，可重复执行）
+bash scripts/mount_nas.sh
 
-兜底映射原理（`scripts/03_search.py` 顶部 `ZH2EN` 表，按长词优先做字符串替换，前后补空格避免粘连）：
+# 1) 只统计不落盘：视频数、总体积、目录分布
+.venv/bin/python scripts/06_index_all.py --dry-run
 
-| 中文 | 映射英文 | 中文 | 映射英文 |
-|---|---|---|---|
-| 帐篷 | tent | 草坪/草地 | lawn |
-| 草原 | grassland | 白色 | white |
-| 黑色 | black | 黑人 | black man |
-| 白人 | white man | 男人/男子 | man |
-| 女人/女子 | woman | 小孩/孩子 | child |
-| 狗 | dog | 猫 | cat |
-| 车/汽车 | car | 房子 | house |
-| 树 | tree | 花 | flower |
-| 水 | water | 天空 | sky |
-| 夜晚 | night | 白天 | daytime |
-| 室内 | indoor | 室外 | outdoor |
+# 2) 小样验证（指定目录与索引位置，不动生产库）
+.venv/bin/python scripts/06_index_all.py --limit 3 \
+  --frames-dir /tmp/smoke/frames --manifest /tmp/smoke/manifest.jsonl --db /tmp/smoke/chroma
 
-> 注意：只是关键词替换，不是翻译模型。`白色帐篷 草坪 黑人` → `white tent lawn black man` 这种简单组合没问题，长句/复杂语义请直接写英文。
+# 3) 按目录分片跑高价值内容（可断点续跑，重复执行自动 skip 已完成）
+nohup .venv/bin/python scripts/06_index_all.py \
+  --include-dir products --workers 3 --nice 10 \
+  > /tmp/index_full.log 2>&1 &
 
-输出示例（排序 + 分数 + 帧路径即截图）：
-
-```text
-[query] 'white tent lawn'
-[encoder] 按 encoder.json 用 siglip2
-[result] top5 (共 32 帧, encoder=siglip2):
-rank score    dist     video_id              time     frame_path
-1    0.8123   0.3754   wedding_a             12.5     frames/wedding_a_12.5.jpg
-2    0.7901   0.4198   wedding_a             13.5     frames/wedding_a_13.5.jpg
-...
+# 4) 全量（数百 GB+ 素材，10 万帧级；CPU 12 核估算 6–10 小时）
+.venv/bin/python scripts/06_index_all.py
 ```
 
-说明：`score = 1 - dist/2`（Chroma cosine distance ∈ [0,2] 换算而来）；若某行尾部出现 `[文件缺失?]`，说明帧文件被删但索引还在，重跑 01 + 02（02 可加 `--rebuild`）即可。
+关键机制：
 
-## 目录结构
-
-```text
-video-finder/
-├── videos_sample/      # 把 mp4 放这里（先 10–20 个，不提交，只留 README.md 说明）
-│   └── README.md
-├── frames/             # 抽出的帧 + manifest.jsonl（.jpg/.manifest 不提交，.gitkeep 占位）
-│   └── .gitkeep
-├── chroma_db/          # Chroma 本地持久化 + encoder.json（不提交，.gitkeep 占位）
-│   └── .gitkeep
-├── scripts/
-│   ├── 01_extract.py   # ffmpeg 抽帧（优先场景切分，失败回退 1fps）
-│   ├── 02_embed_index.py # embedding + 写 Chroma（SigLIP2 → open_clip → dummy；cnclip 可选）
-│   ├── 03_search.py    # CLI 查询（中文直查/可选翻译 + encoder 对齐）
-│   └── 04_eval.py      # 评测：多 encoder 视频级 hit@k/MRR 对比（读本地评测集 JSON）
-├── pyproject.toml
-├── LICENSE             # MIT
-└── README.md
-```
-
-关键文件说明：
-
-- `01_extract.py`：`video_id = 文件名去后缀`；帧命名 `{video_id}_{ss}.jpg`（ss 保留 1 位小数，如 `demo_2.5.jpg`）；manifest 每行 `video_id/time/frame_path/video_path`；支持视频后缀 `.mp4/.mov/.mkv/.avi/.webm/.m4v/.mpg/.mpeg`。
-- `02_embed_index.py`：Chroma collection 名默认 `frames`，`hnsw:space=cosine`，id 形如 `{video_id}@{time:.1f}`，upsert 写入；结束写 `encoder.json {encoder, model_id, dim}`。
-- `03_search.py`：复用 `02` 的 encoder 实现（`importlib` 动态加载，保证两边一致）；`query` 为必填位置参数。
-- `04_eval.py`：读评测集 JSON（`--queries`，含 `queries[{zh,targets}]`），对配置组合（`siglip2+tr` / `siglip2+zh2en` / `cnclip+raw`）分别建索引→逐查询→输出视频级 hit@1/5/10 + MRR，报告写 `--out`（默认 `eval_local/report.json`）。评测数据含自有素材名，放 `eval_local/`（已 `.gitignore`，不入库）。
+| 机制 | 说明 |
+|---|---|
+| 断点续跑 | `state.json` 按视频记录 done/failed + 帧数，重跑自动 skip；失败记录原因不中断整批 |
+| 全局唯一命名 | `video_key = md5(share/relpath)[:8]`，帧名 `{key}_{stem}_{t}.jpg`，避免不同目录同名视频撞名 |
+| 并行 + 限速 | 多进程抽帧（默认 3 worker），worker 内 `os.nice(10)`；主进程批量编码（64 帧/批） |
+| 增量 upsert | 按批 encode + upsert 到 Chroma，崩溃后从断点续 |
+| 元数据自带定位 | manifest / 向量 metadata 携带 `share + relpath`，检索结果直接给出可点击的原始路径 |
 
 ## 评测
 
@@ -195,67 +208,69 @@ uv run python scripts/04_eval.py --queries eval_local/queries.json
 # → 汇总表（hit@1/5/10 + MRR）+ 每查询 top1 视频 + eval_local/report.json
 ```
 
-- 对比配置：`siglip2+tr`（翻译层）/ `siglip2+zh2en`（直查）/ `cnclip+raw`（中文原生），同帧集分别建索引。
-- 首轮结果（2026-09-14，13 视频 / 342 帧 / 17 条中文查询）：
-  | 配置 | hit@1 | hit@5 | MRR | 查询均耗时 |
-  |---|---|---|---|---|
-  | siglip2+翻译 | 0.41 | 0.71 | 0.53 | ~4.5s |
-  | siglip2+直查 | 0.53 | 0.82 | 0.67 | ~0.9s |
-  | cnclip+原样 | 0.47 | 0.88 | 0.67 | ~0.2s |
-- 结论：短中文查询直查优于翻译（翻译层降级为 `--translate` 选项）；CN-CLIP hit@5 最高且最快，中文场景可优先尝试。
+对比配置：`siglip2+tr`（本地翻译层）/ `siglip2+zh2en`（中文直查）/ `cnclip+raw`（中文原生），同一帧集分别建索引。
 
-## 性能说明（无卡会慢是正常的）
+实测（20 个真实品牌视频 / 521 帧；短查询 17 条，长句描述型 12 条，视频级命中率）：
 
-- 本机约束按 12 核 / 30GB / 纯 CPU 设计：embedding 一个 batch 几秒到十几秒正常，先拿 10–20 个视频测通链路。
-- 建议 `--batch-size 4`；内存吃紧用 `--batch-size 2`。
-- HuggingFace 模型下载慢/失败是正常的，脚本会自动回退 `SigLIP2 → open_clip ViT-B/32 → dummy 哈希（仅保链路）`，`chroma_db/encoder.json` 会记录实际用的 encoder。
-- `dummy` 模式分数无语义意义，仅证明“抽帧→索引→查询”链路是通的；看到 `[encoder][WARN] 用 dummy 哈希向量` 即表示当前是兜底模式。
-- `chroma_db/`、`frames/*.jpg`、`videos_sample/*.mp4` 均已 `.gitignore`，不要提交大文件。
+| 配置 | 短查询 hit@1 | 短查询 hit@5 | 长句 hit@5 | 长句 hit@10 | 短查询均耗时 |
+|---|---|---|---|---|---|
+| SigLIP2 + opus-mt 翻译 | 0.24 | 0.35 | 0.58 | 0.58 | ~340ms |
+| SigLIP2 + 中文直查 | 0.29 | 0.71 | 0.75 | 0.75 | ~84ms |
+| **CN-CLIP 中文原生** | **0.41** | **0.82** | **0.83** | **0.92** | **~77ms** |
 
-## 排错
+结论：中文原生 CN-CLIP 命中率最高且最快，翻译层降级为可选路径（`--translate`）。
+以图搜图实测：端到端 ~0.5–0.6s（含上传与编码），同图检索命中相似度 100%。
 
-```bash
-# 看 manifest 是否有帧
-wc -l frames/manifest.jsonl && head -n 2 frames/manifest.jsonl
+> 评测集与索引在 `eval_local/`、`data/`（已 `.gitignore`），仓库只提交代码。
 
-# 看索引里多少帧 / 用的哪个 encoder
-cat chroma_db/encoder.json
-python -c "import chromadb; print(chromadb.PersistentClient(path='chroma_db').get_collection('frames').count())"
+## 目录结构
 
-# 强制用轻量回退（没网/下载失败时）
-python scripts/02_embed_index.py --model openclip
-python scripts/02_embed_index.py --model dummy   # 仅验证链路，分数无意义
-
-# 重建索引（帧删了重抽、或换了 encoder 之后）
-python scripts/02_embed_index.py --rebuild
-
-# 各脚本帮助（参数以 --help 输出为准）
-python scripts/01_extract.py --help
-python scripts/02_embed_index.py --help
-python scripts/03_search.py --help
+```text
+video-finder/
+├── scripts/
+│   ├── 01_extract.py     # ffmpeg 抽帧（场景切分 → 1fps 回退 + 黑场过滤）
+│   ├── 02_embed_index.py # embedding + 写 Chroma（SigLIP2/open_clip/cnclip/dummy）
+│   ├── 03_search.py      # CLI 文本查询（中文直查 / 可选翻译 / encoder 对齐）
+│   ├── 04_eval.py        # 视频级 hit@k / MRR 评测
+│   ├── 05_api.py         # FastAPI 检索服务（文本 + 以图搜图 + 帧图 + 健康检查）
+│   ├── 06_index_all.py   # 全量索引管线（NAS 直读 / 并行 / 断点续跑）
+│   ├── mount_nas.sh      # 幂等挂载网络共享（凭证外置）
+│   └── keep_tunnel.sh    # 服务与反向隧道保活（凭证外置）
+├── tests/test_smoke.py   # 48 项冒烟测试
+├── docs/                 # 前后端接口契约与页面规格
+├── pyproject.toml
+├── LICENSE               # MIT
+└── README.md
 ```
 
-常见坑：
+关键文件说明：
+
+- `01_extract.py`：`video_id = 文件名去后缀`；帧命名 `{video_id}_{ss}.jpg`（保留 1 位小数）；manifest 每行 `video_id/time/frame_path/video_path`。
+- `02_embed_index.py`：Chroma collection 默认 `frames`，`hnsw:space=cosine`，id 形如 `{video_id}@{time:.1f}`；结束写 `encoder.json {encoder, model_id, dim}`。
+- `05_api.py`：`score = 1 - dist / 2`（cosine ∈ [0,2] 归一化）；`ensure_state()` 懒加载模型；CORS 全开供前端直连。
+- `06_index_all.py`：`--db` 为索引根，Chroma 实际写入 `<db>/<encoder>/`，与评测库结构对齐，API 默认探测顺序可直接命中。
+
+## 常见坑
 
 | 现象 | 原因 / 解法 |
 |---|---|
 | `torchvision::nms does not exist` | 混装了 CUDA 版 torchvision；按快速开始先用 CPU index 装 `torch torchvision` 再 `uv pip install -e .` |
-| `videos_sample 里没有视频文件` | 01 扫描不到支持后缀；确认文件在 `videos_sample/` 且后缀在支持列表 |
-| `manifest 为空或不存在，先跑 01_extract.py` | 02 找不到 manifest；先跑 01，确认 `frames/manifest.jsonl` 非空 |
-| `collection 不存在，先跑 02_embed_index.py` | 03 找不到 Chroma collection；先跑 02 |
+| `manifest 为空或不存在` | 先跑 `01_extract.py`，确认 `frames/manifest.jsonl` 非空 |
+| `collection 不存在` | 先跑 `02_embed_index.py` |
 | 查询全是 `[文件缺失?]` | 帧文件被删但索引还在；重跑 01 + 02（02 加 `--rebuild`） |
-| 中文查不准 | 默认直查已是最优（评测）；仍不准时改用英文自然描述，或试 `--translate` / `--model cnclip`（中文原生，需配对索引） |
-| `dummy` 分数随机 | 无网兜底模式预期行为；有网后重跑 02 自动升级到 SigLIP2/open_clip |
+| `dummy` 分数随机 | 无网兜底模式；有网后重跑 02 自动升级到 SigLIP2 / CN-CLIP |
+| NAS 全量遍历慢 | 已在管线内剪枝 `@eaDir / #recycle / site-packages / node_modules` 等；建议先 `--include-dir` 分片跑 |
 
 ## Roadmap
 
-- [x] 评测基础设施 `scripts/04_eval.py`（视频级 hit@k/MRR）+ 首轮评测（13 视频 × 17 查询）：短中文查询直查 > opus-mt 翻译；CN-CLIP hit@5 最高、耗时最低；翻译层降级为 `--translate` 可选，2026-09-14。
-- [ ] 扩评测集（20+ 视频、长句/描述型查询）后定默认 encoder 与默认查询路径。
-- [ ] 时间定位更细：场景内多帧去重 + 镜头边界微调，`time` 精度从 0.1s 向帧级对齐。
-- [ ] 检索体验：`03_search.py` 加 `--show` 直接拼图预览 / 输出 HTML 报告。
-- [ ] 增量索引：01 抽帧增量追加、02 按 `video_id` 增量 upsert，避免每次 `--rebuild` 全量重建。
-- [ ] 评测集：固定 20 个视频 + 20 条查询，记录各 encoder（SigLIP2 / open_clip / dummy）的 top-k 命中率。
-- [ ] 打包：`uv run` 一键脚本 + 示例视频生成器，非技术用户也能三步跑通。
+- [x] 评测基础设施 `scripts/04_eval.py`（视频级 hit@k/MRR）+ 20 视频 / 521 帧实测：中文原生 CN-CLIP 最优。
+- [x] 评测集扩展至 20 个视频（短查询 17 条 + 长句 12 条），确定默认路径为中文直查、CN-CLIP 为推荐 encoder。
+- [x] 服务化：FastAPI 文本检索 + 以图搜图 + 关键帧回传。
+- [x] 全量索引管线：NAS 直读、并行、断点续跑（面向 数千个 视频 / 数百 GB+）。
+- [ ] 全量索引实跑 + 检索质量回归（50+ 视频真实查询重测）。
+- [ ] 时间定位更细：场景内多帧去重 + 镜头边界微调（0.1s → 帧级）。
+- [ ] 结构化元数据混合检索：目录/年份/品类字典 + 向量召回融合。
+- [ ] 面向终端用户的交互层（聊天机器人 / Web 前端）。
 
 ## License
 

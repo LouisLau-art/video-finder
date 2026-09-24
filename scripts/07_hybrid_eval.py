@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""工单 04：视频级双路召回评测与语义回归。
+"""工单 04：视频级语义通道、关键词通道与融合评测。
 
 专有名称样本由向量库元数据自验证生成，默认写入 gitignored 的 eval_local/；
 报告只保存聚合指标，不保存真实素材名。
+
+退出码：0=回归通过，1=脚本错误，2=回归不通过，3=无法判定。
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import importlib.util
 import json
 import re
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +23,19 @@ ROOT = Path(__file__).resolve().parents[1]
 API_PATH = ROOT / "scripts/05_api.py"
 DEFAULT_EVAL_DIR = ROOT / "eval_local"
 HASH_NAME_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
+
+EXIT_OK = 0
+EXIT_SCRIPT_ERROR = 1
+EXIT_REGRESSION_FAILED = 2
+EXIT_REGRESSION_UNKNOWN = 3
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """把命令行参数错误归入脚本错误退出码。"""
+
+    def error(self, message: str):  # pragma: no cover - argparse 专用分支
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_SCRIPT_ERROR, f"{self.prog}: error: {message}\n")
 
 
 def _load_api_module(name: str):
@@ -99,7 +115,7 @@ def _metric_summary(
     rankings: dict[str, list[str]],
     top_k: int,
 ) -> dict[str, Any]:
-    """按视频级目标计算三路命中率与目标独占命中数。"""
+    """按视频级目标计算语义通道、关键词通道与融合结果的命中率和目标独占数。"""
     semantic_hits = 0
     keyword_hits = 0
     fused_hits = 0
@@ -289,6 +305,54 @@ def _load_metadata(api: Any, col: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in (payload.get("metadatas") or []) if isinstance(item, dict)]
 
 
+def _metadata_digest(metas: list[dict[str, Any]]) -> str:
+    """对规范化后的元数据做全量 SHA-256 摘要，不保存原始名称。"""
+    canonical_rows = sorted(
+        json.dumps(
+            meta,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        for meta in metas
+    )
+    digest = hashlib.sha256()
+    for row in canonical_rows:
+        digest.update(row.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _index_signature(
+    db: str,
+    collection: str,
+    count: int,
+    encoder_name: str,
+    metas: list[dict[str, Any]],
+) -> str:
+    """把索引身份与元数据内容摘要组合成可比较签名。"""
+    return "|".join(
+        (
+            f"db={Path(db).resolve()}",
+            f"collection={collection}",
+            f"count={int(count)}",
+            f"encoder={encoder_name}",
+            f"metadata_sha256={_metadata_digest(metas)}",
+        )
+    )
+
+
+def _signature_method() -> dict[str, Any]:
+    return {
+        "algorithm": "SHA-256",
+        "scope": "all_collection_metadata_canonicalized_and_sorted",
+        "includes_embeddings": False,
+        "rationale": "检测元数据内容替换，不把真实名称写入产物",
+        "risk": "元数据完全相同但向量被替换时无法检测；SHA-256 碰撞风险可忽略",
+    }
+
+
 def run_proprietary(
     api: Any,
     db: str,
@@ -341,6 +405,10 @@ def run_proprietary(
     summary["generic_query_count"] = sum(bool(c.get("generic")) for c in cases)
     summary["generic_injection"] = _generic_injection_summary(cases, rankings, top_k)
     summary["coverage_ledger"] = _coverage_ledger(index)
+    summary["index_signature"] = _index_signature(
+        db, collection, len(metas), api._ENCODER_NAME, metas
+    )
+    summary["index_signature_method"] = _signature_method()
     summary["query_provenance"] = {
         "kind": "self_validated_extracted_text",
         "optimistic_upper_bound": True,
@@ -374,9 +442,13 @@ def run_semantic_regression(
     _configure_api(api, db, collection)
     encoder, col = api.ensure_state()
     m3 = api.load_search_module()
-    signature = f"{Path(db).resolve()}|{collection}|{int(col.count())}|{api._ENCODER_NAME}"
+    metas = _load_metadata(api, col)
+    signature = _index_signature(
+        db, collection, len(metas), api._ENCODER_NAME, metas
+    )
     output: dict[str, Any] = {
         "signature": signature,
+        "index_signature_method": _signature_method(),
         "query_sets": {},
     }
     snapshot = None
@@ -466,7 +538,7 @@ def run_semantic_regression(
             current["regression_pass"] = None
         output["query_sets"][filename] = current
 
-    if baseline_snapshot is not None and write_baseline and not baseline_snapshot.exists():
+    if baseline_snapshot is not None and write_baseline:
         _write_json(baseline_snapshot, {
             "version": 1,
             "eval_signature": signature,
@@ -478,8 +550,20 @@ def run_semantic_regression(
     return output
 
 
+def _regression_gate(query_sets: dict[str, Any]) -> tuple[str, int]:
+    """把各评测集的回归状态汇总为可区分的退出码。"""
+    states = [item.get("regression_pass") for item in query_sets.values()]
+    if not states:
+        return "not_run", EXIT_REGRESSION_UNKNOWN
+    if any(state is False for state in states):
+        return "failed", EXIT_REGRESSION_FAILED
+    if any(state is None for state in states):
+        return "indeterminate", EXIT_REGRESSION_UNKNOWN
+    return "passed", EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="视频级双路召回评测与语义回归")
+    parser = _ArgumentParser(description="视频级语义通道、关键词通道与融合评测")
     parser.add_argument("--db", default="data/local-runtime/index_full/cnclip")
     parser.add_argument("--collection", default="frames")
     parser.add_argument("--semantic-db", default="data/local-runtime/eval_chroma/cnclip")
@@ -491,6 +575,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--parent-cases", type=int, default=30)
     parser.add_argument("--generic-cases", type=int, default=10)
     parser.add_argument("--baseline-snapshot", default="eval_local/semantic_baseline.json")
+    parser.add_argument(
+        "--gate-report",
+        help="只读取已有评测报告并按回归状态返回退出码",
+    )
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--skip-proprietary", action="store_true")
     parser.add_argument("--skip-semantic", action="store_true")
@@ -499,6 +587,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.gate_report:
+        gate_report = json.loads(Path(args.gate_report).read_text(encoding="utf-8"))
+        query_sets = gate_report.get("semantic_regression", {}).get("query_sets", {})
+        state, code = _regression_gate(query_sets)
+        print(json.dumps({
+            "gate_report": str(args.gate_report),
+            "regression_status": state,
+            "exit_code": code,
+        }, ensure_ascii=False))
+        return code
+
     eval_dir = Path(args.eval_dir)
     report: dict[str, Any] = {
         "version": 1,
@@ -527,14 +626,35 @@ def main() -> int:
             Path(args.baseline_snapshot) if args.baseline_snapshot else None,
             args.write_baseline,
         )
+    state, code = _regression_gate(
+        report.get("semantic_regression", {}).get("query_sets", {})
+    )
+    report["regression_status"] = state
+    report["regression_exit_code"] = code
     _write_json(Path(args.report_out), report)
     print(json.dumps({
         "report": str(args.report_out),
         "proprietary_sample_count": report.get("proprietary", {}).get("sample_count"),
         "semantic_query_sets": sorted(report.get("semantic_regression", {}).get("query_sets", {})),
+        "regression_status": state,
+        "exit_code": code,
     }, ensure_ascii=False))
-    return 0
+    return code
+
+
+def cli_main() -> int:
+    """将未处理异常统一映射为脚本错误退出码。"""
+    try:
+        return main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(
+            f"评测脚本错误 ({type(exc).__name__}): {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_SCRIPT_ERROR
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli_main())

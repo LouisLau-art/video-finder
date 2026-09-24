@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -134,3 +137,63 @@ def test_proprietary_case_builder_covers_filename_parent_and_generic_sources():
     assert "parent" in sources
     assert any(case["generic"] for case in cases)
     assert all(case["query"] and case["targets"] for case in cases)
+
+
+def test_gate_report_exit_codes_distinguish_pass_fail_and_unknown(tmp_path):
+    module = _load_eval_module()
+    assert module.EXIT_OK == 0
+    assert module.EXIT_SCRIPT_ERROR == 1
+    assert module.EXIT_REGRESSION_FAILED == 2
+    assert module.EXIT_REGRESSION_UNKNOWN == 3
+
+    codes = []
+    for state in (True, False, None):
+        report_path = tmp_path / f"report_{str(state).lower()}.json"
+        report_path.write_text(
+            json.dumps({
+                "semantic_regression": {
+                    "query_sets": {
+                        "queries.json": {"regression_pass": state},
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--gate-report", str(report_path)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        codes.append(result.returncode)
+
+    assert codes == [module.EXIT_OK, module.EXIT_REGRESSION_FAILED, module.EXIT_REGRESSION_UNKNOWN]
+    assert len(set(codes)) == 3
+
+    missing = subprocess.run(
+        [sys.executable, str(SCRIPT), "--gate-report", str(tmp_path / "missing.json")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing.returncode == module.EXIT_SCRIPT_ERROR
+
+
+def test_index_signature_changes_with_metadata_content_but_not_order():
+    module = _load_eval_module()
+    metadata = [
+        {"video_id": "v1", "video_name": "neutral_one.mp4", "time": 1.0},
+        {"video_id": "v2", "video_name": "neutral_two.mp4", "time": 2.0},
+    ]
+    same = module._index_signature(
+        "db", "frames", len(metadata), "test-encoder", list(reversed(metadata))
+    )
+    original = module._index_signature("db", "frames", 2, "test-encoder", metadata)
+    changed_metadata = [dict(metadata[0]), {**metadata[1], "video_name": "changed.mp4"}]
+    changed = module._index_signature("db", "frames", 2, "test-encoder", changed_metadata)
+
+    assert same == original
+    assert changed != original
+    assert "metadata_sha256=" in original

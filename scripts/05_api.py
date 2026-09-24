@@ -140,7 +140,7 @@ VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED = _env_bool(
 
 # 关键词通道默认开启；关闭后保留工单 01 的纯语义响应契约。
 KEYWORD_CHANNEL_ENABLED = _env_bool("VIDEO_FINDER_KEYWORD_ENABLED", True)
-# RRF 只使用名次，不把两路分数混在一起。
+# RRF 只使用名次，不把语义通道与关键词通道的分数混在一起。
 RRF_K = 60
 
 # 视频 ID -> 站点内网完整路径（随 site.json 下发，本仓库不存真实值）

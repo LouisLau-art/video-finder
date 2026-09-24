@@ -92,6 +92,33 @@ DEFAULT_COLLECTION = "frames"
 
 # 连续 0 帧/失败熔断阈值（疑似 NAS 掉线时中止，避免空转写脏 state）
 MAX_CONSECUTIVE_EMPTY = 20
+DEFAULT_MEMORY_LIMIT_MB = 8192
+
+
+class MemoryLimitReached(RuntimeError):
+    """RSS 超过保护阈值，携带当前读数交给主流程安全退出。"""
+
+    def __init__(self, rss_mb: float, limit_mb: float):
+        super().__init__(f"RSS {rss_mb:.1f}MB 超过上限 {limit_mb:.1f}MB")
+        self.rss_mb = float(rss_mb)
+        self.limit_mb = float(limit_mb)
+
+
+def _rss_mb() -> float:
+    """读取当前进程 RSS；无法读取时返回 0，交给调用方决定是否启用保护。"""
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VmRSS:"):
+                return float(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def enforce_memory_limit(rss_mb: float, limit_mb: float) -> None:
+    """统一执行 RSS 保护，便于单元测试和主流程复用。"""
+    if limit_mb > 0 and rss_mb > limit_mb:
+        raise MemoryLimitReached(rss_mb, limit_mb)
 
 
 # ---------- 发现 ----------
@@ -259,6 +286,24 @@ def _extract_job(job: dict) -> dict:
                 "rows": [], "frames": 0}
 
 
+def pending_upsert_state(video: dict, rows: list[dict]) -> dict:
+    """帧已落盘但向量尚未确认时写入可安全续跑的状态。"""
+    return {
+        "status": "done",
+        "mtime": video["mtime"],
+        "size": video["size"],
+        "frames": [Path(row["frame_path"]).name for row in rows],
+        "pending_upsert": True,
+    }
+
+
+def iter_batches(items: list, batch_size: int):
+    """按固定上限切分列表，避免调用方一次性构造超大批次。"""
+    size = max(int(batch_size), 1)
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
 # ---------- 状态 / manifest ----------
 
 def load_state(db_dir: Path) -> dict:
@@ -341,6 +386,8 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="忽略断点状态，全部重跑")
     ap.add_argument("--max-consecutive-empty", type=int, default=MAX_CONSECUTIVE_EMPTY,
                     help="连续 0 帧/失败达到该数即熔断停机（疑似 NAS 掉线），默认 20")
+    ap.add_argument("--memory-limit-mb", type=int, default=DEFAULT_MEMORY_LIMIT_MB,
+                    help="父进程 RSS 保护阈值；超过后保存状态并安全退出，默认 8192MB")
     # 以下为管线必需但任务未列出的配套旋钮（均取与现有脚本一致的默认值）：
     ap.add_argument("--model", default="cnclip",
                     choices=["siglip2", "cnclip", "openclip", "dummy"])
@@ -348,6 +395,8 @@ def main() -> int:
     ap.add_argument("--fps", type=float, default=1.0, help="回退模式帧率（透传 01）")
     ap.add_argument("--max-per-scene", type=int, default=3, help="每场景最多帧数（透传 01）")
     args = ap.parse_args()
+    args.batch_size = max(int(args.batch_size), 1)
+    args.memory_limit_mb = max(int(args.memory_limit_mb), 0)
 
     frames_dir = Path(args.frames_dir)
     manifest = Path(args.manifest) if args.manifest else frames_dir / "manifest.jsonl"
@@ -482,36 +531,62 @@ def main() -> int:
              "fps": args.fps, "max_per_scene": args.max_per_scene} for v in todo]
     by_key = {v["video_key"]: v for v in todo}
 
+    def check_memory_limit() -> None:
+        limit_mb = max(int(args.memory_limit_mb), 0)
+        if limit_mb <= 0:
+            return
+        rss_mb = _rss_mb()
+        enforce_memory_limit(rss_mb, limit_mb)
+
     def flush_batch(pending: list[tuple[str, list[dict]]]) -> tuple[int, list[str]]:
-        """一批 rows -> encode+upsert。返回 (成功帧数, [成功video_key])；整批失败则记 failed。"""
+        """按 batch-size 分块解码/编码，避免单支视频一次撑满内存。"""
         flat: list[dict] = [r for _, rs in pending for r in rs]
         if not flat:
             return 0, [k for k, _ in pending]
+        batch_size = max(int(args.batch_size), 1)
+        written = 0
         try:
-            imgs: list[Image.Image] = []
-            keep: list[dict] = []
-            for r in flat:
-                p = Path(r["frame_path"])
-                if not p.is_file():
-                    print(f"[warn] 帧文件丢失跳过: {p}", file=sys.stderr)
-                    continue
+            for chunk in iter_batches(flat, batch_size):
+                check_memory_limit()
+                imgs: list[Image.Image] = []
+                keep: list[dict] = []
                 try:
-                    imgs.append(Image.open(p).convert("RGB"))
-                    keep.append(r)
-                except Exception as e:
-                    print(f"[warn] 读图失败跳过 {p}: {e}", file=sys.stderr)
-            if not keep:
-                return 0, [k for k, _ in pending]
-            embs = encoder.encode_images(imgs)
-            ids = [f"{r['video_key']}_{r['video_id']}@{r['time']:.1f}" for r in keep]
-            metas = [{"video_id": r["video_id"], "video_name": r["video_id"] + ".mp4",
-                      "time": float(r["time"]), "frame_path": str(r["frame_path"]),
-                      "video_path": str(r["video_path"]),
-                      "share": r["share"], "relpath": r["relpath"]} for r in keep]
-            docs = [f"{r['video_id']} @ {r['time']:.1f}s" for r in keep]
-            col.upsert(ids=ids, embeddings=embs.tolist(),
-                       metadatas=metas, documents=docs)
-            return len(keep), [k for k, _ in pending]
+                    for r in chunk:
+                        p = Path(r["frame_path"])
+                        if not p.is_file():
+                            print(f"[warn] 帧文件丢失跳过: {p}", file=sys.stderr)
+                            continue
+                        try:
+                            with Image.open(p) as source:
+                                imgs.append(source.convert("RGB"))
+                            keep.append(r)
+                        except Exception as e:
+                            print(f"[warn] 读图失败跳过 {p}: {e}", file=sys.stderr)
+                    if keep:
+                        embs = encoder.encode_images(imgs)
+                        ids = [f"{r['video_key']}_{r['video_id']}@{r['time']:.1f}"
+                               for r in keep]
+                        metas = [{
+                            "video_id": r["video_id"],
+                            "video_name": r["video_id"] + ".mp4",
+                            "time": float(r["time"]),
+                            "frame_path": str(r["frame_path"]),
+                            "video_path": str(r["video_path"]),
+                            "share": r["share"],
+                            "relpath": r["relpath"],
+                        } for r in keep]
+                        docs = [f"{r['video_id']} @ {r['time']:.1f}s" for r in keep]
+                        col.upsert(ids=ids, embeddings=embs.tolist(),
+                                   metadatas=metas, documents=docs)
+                        written += len(keep)
+                        del embs, ids, metas, docs
+                finally:
+                    for image in imgs:
+                        image.close()
+                check_memory_limit()
+            return written, [k for k, _ in pending]
+        except MemoryLimitReached:
+            raise
         except Exception as e:  # noqa: BLE001 — 整批失败，主进程记录后继续
             print(f"[error] encode/upsert 整批失败（{len(flat)} 帧）: "
                   f"{type(e).__name__}: {e}", file=sys.stderr)
@@ -531,6 +606,7 @@ def main() -> int:
     # 达到阈值即判定疑似 NAS 掉线，熔断停机。
     consecutive_empty = 0
     fused = False
+    memory_stop: MemoryLimitReached | None = None
     max_empty = max(int(args.max_consecutive_empty), 1)
     t0 = time.time()
     workers = max(int(args.workers), 1)
@@ -546,7 +622,12 @@ def main() -> int:
                 pending.append((vkey, rows))
                 pending_frames += len(rows)
                 if pending_frames >= args.batch_size:
-                    _ok_frames, ok_keys = flush_batch(pending)
+                    try:
+                        _ok_frames, ok_keys = flush_batch(pending)
+                    except MemoryLimitReached as exc:
+                        memory_stop = exc
+                        pool.terminate()
+                        break
                     for k in ok_keys:
                         vv = by_key[k]
                         krows = next(rs for kk, rs in pending if kk == k)
@@ -562,9 +643,7 @@ def main() -> int:
                 else:
                     # 未到一批：先记 done（帧已落盘+manifest 已记），向量在 flush 时补；
                     # pending_upsert 标记崩溃残留，下次续跑强制重跑补向量。
-                    state[vkey] = {"status": "done", "mtime": v["mtime"], "size": v["size"],
-                                   "frames": [Path(r["frame_path"]).name for r in rows],
-                                   "pending_upsert": True}
+                    state[vkey] = pending_upsert_state(v, rows)
                     if not rows:
                         state[vkey]["empty_confirmed"] = True
                     save_state(db_dir, state)
@@ -580,6 +659,12 @@ def main() -> int:
                 save_state(db_dir, state)
                 n_failed += 1
                 consecutive_empty += 1
+            try:
+                check_memory_limit()
+            except MemoryLimitReached as exc:
+                memory_stop = exc
+                pool.terminate()
+                break
             el = time.time() - t0
             rate = cum_frames / el if el > 0 else 0.0
             avg_per_vid = cum_frames / max(done_idx, 1)
@@ -601,19 +686,40 @@ def main() -> int:
                 fused = True
                 break
     # 尾批（不足一批的剩余帧）：成功则去掉 pending_upsert 转正，失败已在内部记 failed
-    if pending:
-        _ok_frames, ok_keys = flush_batch(pending)
-        ok_set = set(ok_keys)
+    if pending and not memory_stop:
+        try:
+            _ok_frames, ok_keys = flush_batch(pending)
+        except MemoryLimitReached as exc:
+            memory_stop = exc
+        else:
+            ok_set = set(ok_keys)
+            for k, krows in pending:
+                if k in ok_set:
+                    vv = by_key[k]
+                    state[k] = {"status": "done", "mtime": vv["mtime"], "size": vv["size"],
+                                "frames": [Path(r["frame_path"]).name for r in krows]}
+                    if not krows:
+                        state[k]["empty_confirmed"] = True
+            save_state(db_dir, state)
+    if man_f:
+        man_f.close()
+
+    if memory_stop is not None:
         for k, krows in pending:
-            if k in ok_set:
-                vv = by_key[k]
-                state[k] = {"status": "done", "mtime": vv["mtime"], "size": vv["size"],
-                            "frames": [Path(r["frame_path"]).name for r in krows]}
+            if not state.get(k, {}).get("pending_upsert"):
+                state[k] = pending_upsert_state(by_key[k], krows)
                 if not krows:
                     state[k]["empty_confirmed"] = True
         save_state(db_dir, state)
-    if man_f:
-        man_f.close()
+        print(
+            f"[MEMORY] RSS={memory_stop.rss_mb:.1f}MB 超过上限 "
+            f"{memory_stop.limit_mb:.1f}MB；frames={cum_frames} "
+            f"done={n_done} failed={n_failed}。state 已保存，"
+            "停止提交新任务；恢复内存后重跑相同命令即可续跑。",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 3
 
     # encoder.json 写进 chroma 子目录（与 02/03/API 的 load_encoder 约定一致）
     (Path(chroma_path) / "encoder.json").write_text(

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "description": "复制到 gitignored 的 eval_local/real_acceptance_cases.json 后填写真实本地验收数据。模板值全部是中性占位，不得直接提交。",
+  "cases": [
+    {
+      "id": "real_failure_001",
+      "query": "placeholder_real_query",
+      "target_video_id": "placeholder_target_video_id",
+      "notes": "placeholder_note：说明这是改造前无法召回的真实专有名称"
+    }
+  ]
+}

@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "description": "脱敏的真实失败形状回归夹具；所有文本均为中性占位，不对应真实素材。",
+  "cases": [
+    {
+      "id": "failure_proper_name_unmapped",
+      "failure_shape": "proper_name_unmapped",
+      "query": "placeholder_proper_series_name",
+      "fixture_id": "fixture_proper_name_unmapped",
+      "expected_target_video_id": "fixture_proper_name_target",
+      "construction": "专有名称占位词只出现在目标文件名中；语义夹具故意把目标排在Top-K之外。"
+    },
+    {
+      "id": "failure_filename_not_exact",
+      "failure_shape": "filename_not_exact",
+      "query": "placeholder_line_alpha",
+      "fixture_id": "fixture_filename_not_exact",
+      "expected_target_video_id": "fixture_filename_alias_target",
+      "construction": "查询是完整文件名的占位简称；目标语义排名在Top-K之外，关键词通道可通过子串命中。"
+    },
+    {
+      "id": "failure_parent_only",
+      "failure_shape": "parent_only",
+      "query": "placeholder_series_only",
+      "fixture_id": "fixture_parent_only",
+      "expected_target_video_id": "fixture_parent_only_target",
+      "construction": "查询只出现在有意义的父目录片段中，不出现在目标文件名中。"
+    },
+    {
+      "id": "failure_generic_overlap",
+      "failure_shape": "generic_overlap",
+      "query": "placeholder_popular_series",
+      "fixture_id": "fixture_generic_overlap",
+      "expected_target_video_id": "fixture_generic_aaa_target",
+      "construction": "查询是热门目录占位词；多个素材共享目录片段，目标语义排名在Top-K之外但关键词排名靠前。"
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "fixture_proper_name_unmapped",
+      "top_k": 3,
+      "frames": [
+        {
+          "video_id": "fixture_proper_name_noise_1",
+          "video_name": "placeholder_noise_one.mp4",
+          "relpath": "placeholder_collection/placeholder_noise_one.mp4",
+          "share": "placeholder_share",
+          "time": 0.0
+        },
+        {
+          "video_id": "fixture_proper_name_noise_2",
+          "video_name": "placeholder_noise_two.mp4",
+          "relpath": "placeholder_collection/placeholder_noise_two.mp4",
+          "share": "placeholder_share",
+          "time": 1.0
+        },
+        {
+          "video_id": "fixture_proper_name_noise_3",
+          "video_name": "placeholder_noise_three.mp4",
+          "relpath": "placeholder_collection/placeholder_noise_three.mp4",
+          "share": "placeholder_share",
+          "time": 2.0
+        },
+        {
+          "video_id": "fixture_proper_name_target",
+          "video_name": "placeholder_proper_series_name.mp4",
+          "relpath": "placeholder_collection/placeholder_proper_series_name.mp4",
+          "share": "placeholder_share",
+          "time": 3.0
+        }
+      ],
+      "semantic_order": [
+        "fixture_proper_name_noise_1",
+        "fixture_proper_name_noise_2",
+        "fixture_proper_name_noise_3",
+        "fixture_proper_name_target"
+      ]
+    },
+    {
+      "id": "fixture_filename_not_exact",
+      "top_k": 3,
+      "frames": [
+        {
+          "video_id": "fixture_filename_noise_1",
+          "video_name": "placeholder_noise_one.mp4",
+          "relpath": "placeholder_collection/placeholder_noise_one.mp4",
+          "share": "placeholder_share",
+          "time": 0.0
+        },
+        {
+          "video_id": "fixture_filename_noise_2",
+          "video_name": "placeholder_noise_two.mp4",
+          "relpath": "placeholder_collection/placeholder_noise_two.mp4",
+          "share": "placeholder_share",
+          "time": 1.0
+        },
+        {
+          "video_id": "fixture_filename_noise_3",
+          "video_name": "placeholder_noise_three.mp4",
+          "relpath": "placeholder_collection/placeholder_noise_three.mp4",
+          "share": "placeholder_share",
+          "time": 2.0
+        },
+        {
+          "video_id": "fixture_filename_alias_target",
+          "video_name": "placeholder_line_alpha_specialedition.mp4",
+          "relpath": "placeholder_collection/placeholder_line_alpha_specialedition.mp4",
+          "share": "placeholder_share",
+          "time": 3.0
+        }
+      ],
+      "semantic_order": [
+        "fixture_filename_noise_1",
+        "fixture_filename_noise_2",
+        "fixture_filename_noise_3",
+        "fixture_filename_alias_target"
+      ]
+    },
+    {
+      "id": "fixture_parent_only",
+      "top_k": 3,
+      "frames": [
+        {
+          "video_id": "fixture_parent_noise_1",
+          "video_name": "placeholder_noise_one.mp4",
+          "relpath": "placeholder_collection/placeholder_noise_one.mp4",
+          "share": "placeholder_share",
+          "time": 0.0
+        },
+        {
+          "video_id": "fixture_parent_noise_2",
+          "video_name": "placeholder_noise_two.mp4",
+          "relpath": "placeholder_collection/placeholder_noise_two.mp4",
+          "share": "placeholder_share",
+          "time": 1.0
+        },
+        {
+          "video_id": "fixture_parent_noise_3",
+          "video_name": "placeholder_noise_three.mp4",
+          "relpath": "placeholder_collection/placeholder_noise_three.mp4",
+          "share": "placeholder_share",
+          "time": 2.0
+        },
+        {
+          "video_id": "fixture_parent_only_target",
+          "video_name": "placeholder_plain_frame.mp4",
+          "relpath": "placeholder_parent/placeholder_series_only/placeholder_plain_frame.mp4",
+          "share": "placeholder_share",
+          "time": 3.0
+        }
+      ],
+      "semantic_order": [
+        "fixture_parent_noise_1",
+        "fixture_parent_noise_2",
+        "fixture_parent_noise_3",
+        "fixture_parent_only_target"
+      ]
+    },
+    {
+      "id": "fixture_generic_overlap",
+      "top_k": 4,
+      "frames": [
+        {
+          "video_id": "fixture_generic_zzz_noise_1",
+          "video_name": "placeholder_noise_one.mp4",
+          "relpath": "placeholder_popular_series/placeholder_noise_one.mp4",
+          "share": "placeholder_share",
+          "time": 0.0
+        },
+        {
+          "video_id": "fixture_generic_zzz_noise_2",
+          "video_name": "placeholder_noise_two.mp4",
+          "relpath": "placeholder_popular_series/placeholder_noise_two.mp4",
+          "share": "placeholder_share",
+          "time": 1.0
+        },
+        {
+          "video_id": "fixture_generic_zzz_noise_3",
+          "video_name": "placeholder_noise_three.mp4",
+          "relpath": "placeholder_popular_series/placeholder_noise_three.mp4",
+          "share": "placeholder_share",
+          "time": 2.0
+        },
+        {
+          "video_id": "fixture_generic_nonkeyword",
+          "video_name": "placeholder_unrelated_frame.mp4",
+          "relpath": "placeholder_unrelated_series/placeholder_unrelated_frame.mp4",
+          "share": "placeholder_share",
+          "time": 3.0
+        },
+        {
+          "video_id": "fixture_generic_aaa_target",
+          "video_name": "placeholder_target_frame.mp4",
+          "relpath": "placeholder_popular_series/placeholder_target_frame.mp4",
+          "share": "placeholder_share",
+          "time": 4.0
+        }
+      ],
+      "semantic_order": [
+        "fixture_generic_zzz_noise_1",
+        "fixture_generic_zzz_noise_2",
+        "fixture_generic_zzz_noise_3",
+        "fixture_generic_nonkeyword",
+        "fixture_generic_aaa_target"
+      ]
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 """工单 04：视频级语义通道、关键词通道与融合评测。
 
 专有名称样本由向量库元数据自验证生成，默认写入 gitignored 的 eval_local/；
-报告只保存聚合指标，不保存真实素材名。
+报告只保存聚合指标，不保存真实素材名。`--failure-shapes-only` 运行开启关键词通道的失败形状门禁，`--failure-shapes-no-keyword` 运行应当失败的负对照。
 
 退出码：0=回归通过，1=脚本错误，2=回归不通过，3=无法判定。
 """
@@ -550,6 +550,130 @@ def run_semantic_regression(
     return output
 
 
+class _FixtureCollection:
+    """为失败形状回归提供确定性的内存向量库。"""
+
+    def __init__(self, fixture: dict[str, Any]):
+        self.frames = [dict(frame) for frame in fixture.get("frames", [])]
+        self.order = [str(value) for value in fixture.get("semantic_order", [])]
+        self.by_id = {str(frame["video_id"]): frame for frame in self.frames}
+
+    def count(self) -> int:
+        return len(self.frames)
+
+    def get(self, include=None):
+        if include != ["metadatas"]:
+            raise AssertionError("失败形状夹具只允许读取元数据")
+        return {"metadatas": [dict(frame) for frame in self.frames]}
+
+    def query(self, *, query_embeddings, n_results, include):
+        if include != ["metadatas", "distances"]:
+            raise AssertionError("失败形状夹具只允许读取元数据和距离")
+        selected = self.order[: max(0, int(n_results))]
+        metas = [dict(self.by_id[video_id]) for video_id in selected]
+        distances = [index / 100.0 for index, _ in enumerate(selected)]
+        return {
+            "ids": [[f"fixture-frame-{index}" for index in range(len(selected))]],
+            "metadatas": [metas],
+            "distances": [distances],
+        }
+
+
+class _FixtureEncoder:
+    name = "fixture-encoder"
+
+    def encode_texts(self, texts):
+        return [[0.0, 1.0] for _ in texts]
+
+
+def _load_failure_shape_fixture(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload.get("cases"), list) or not isinstance(payload.get("fixtures"), list):
+        raise ValueError("失败形状夹具缺少 cases/fixtures")
+    return payload
+
+
+def run_failure_shape_gate(
+    api: Any,
+    fixture_path: Path,
+    keyword_enabled: bool,
+) -> dict[str, Any]:
+    """运行脱敏失败形状；关闭关键词通道时故意返回回归失败。"""
+    payload = _load_failure_shape_fixture(fixture_path)
+    fixtures = {str(item["id"]): item for item in payload["fixtures"]}
+    saved = {
+        "encoder": api._ENCODER,
+        "encoder_name": api._ENCODER_NAME,
+        "collection": api._CHROMA_COL,
+        "count": api._CHROMA_COUNT,
+        "keyword_index": api._KEYWORD_INDEX,
+        "keyword_index_count": api._KEYWORD_INDEX_COUNT,
+        "keyword_enabled": api.KEYWORD_CHANNEL_ENABLED,
+    }
+    rows: list[dict[str, Any]] = []
+    try:
+        for case in payload["cases"]:
+            fixture = fixtures.get(str(case["fixture_id"]))
+            if fixture is None:
+                raise ValueError(f"找不到失败形状夹具: {case.get('fixture_id')}")
+            collection = _FixtureCollection(fixture)
+            api._ENCODER = _FixtureEncoder()
+            api._ENCODER_NAME = api._ENCODER.name
+            api._CHROMA_COL = collection
+            api._CHROMA_COUNT = collection.count()
+            api._KEYWORD_INDEX = None
+            api._KEYWORD_INDEX_COUNT = None
+            api.KEYWORD_CHANNEL_ENABLED = keyword_enabled
+            top_k = int(fixture.get("top_k", 3))
+            vector = api._ENCODER.encode_texts([str(case["query"])])[0]
+            result = api.search_by_embedding(
+                vector,
+                top_k,
+                str(case["query"]),
+                keyword_query=str(case["query"]),
+            )
+            result_ids = [str(row["video_id"]) for row in result["data"]["results"]]
+            actual_hit = str(case["expected_target_video_id"]) in result_ids
+            expected_hit = bool(keyword_enabled)
+            rows.append({
+                "id": str(case["id"]),
+                "failure_shape": str(case["failure_shape"]),
+                "expected_hit": expected_hit,
+                "actual_hit": actual_hit,
+                "passed": actual_hit == expected_hit,
+            })
+    finally:
+        api._ENCODER = saved["encoder"]
+        api._ENCODER_NAME = saved["encoder_name"]
+        api._CHROMA_COL = saved["collection"]
+        api._CHROMA_COUNT = saved["count"]
+        api._KEYWORD_INDEX = saved["keyword_index"]
+        api._KEYWORD_INDEX_COUNT = saved["keyword_index_count"]
+        api.KEYWORD_CHANNEL_ENABLED = saved["keyword_enabled"]
+
+    all_passed = all(row["passed"] for row in rows)
+    all_missed = all(not row["actual_hit"] for row in rows)
+    if keyword_enabled:
+        status = "passed" if all_passed else "failed"
+        code = EXIT_OK if all_passed else EXIT_REGRESSION_FAILED
+    elif all_missed:
+        # 负对照达到预期，但目标召回门禁应当失败。
+        status = "negative_control_passed_gate_failed"
+        code = EXIT_REGRESSION_FAILED
+    else:
+        status = "invalid_negative_control"
+        code = EXIT_SCRIPT_ERROR
+    return {
+        "case_count": len(rows),
+        "keyword_enabled": keyword_enabled,
+        "all_expected_hits": all(row["actual_hit"] for row in rows),
+        "all_expected_misses": all_missed,
+        "status": status,
+        "exit_code": code,
+        "cases": rows,
+    }
+
+
 def _regression_gate(query_sets: dict[str, Any]) -> tuple[str, int]:
     """把各评测集的回归状态汇总为可区分的退出码。"""
     states = [item.get("regression_pass") for item in query_sets.values()]
@@ -562,6 +686,20 @@ def _regression_gate(query_sets: dict[str, Any]) -> tuple[str, int]:
     return "passed", EXIT_OK
 
 
+def _combine_gate(
+    query_sets: dict[str, Any],
+    failure_shape_report: dict[str, Any] | None = None,
+) -> tuple[str, int]:
+    """合并语义回归门禁与失败形状护栏，脚本错误优先返回 1。"""
+    semantic_state, semantic_code = _regression_gate(query_sets)
+    shape_code = int((failure_shape_report or {}).get("exit_code", EXIT_OK))
+    if shape_code == EXIT_SCRIPT_ERROR:
+        return "script_error", EXIT_SCRIPT_ERROR
+    if shape_code == EXIT_REGRESSION_FAILED:
+        return "failed", EXIT_REGRESSION_FAILED
+    return semantic_state, semantic_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(description="视频级语义通道、关键词通道与融合评测")
     parser.add_argument("--db", default="data/local-runtime/index_full/cnclip")
@@ -570,6 +708,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-dir", default="eval_local")
     parser.add_argument("--cases-out", default="eval_local/proprietary_queries.json")
     parser.add_argument("--report-out", default="eval_local/hybrid_report.json")
+    parser.add_argument(
+        "--failure-shape-fixture",
+        default="eval_fixtures/real_failure_shapes.json",
+    )
+    parser.add_argument(
+        "--failure-report-out",
+        default="eval_local/failure_shape_report.json",
+    )
+    parser.add_argument("--failure-shapes-only", action="store_true")
+    parser.add_argument("--failure-shapes-no-keyword", action="store_true")
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--filename-cases", type=int, default=30)
     parser.add_argument("--parent-cases", type=int, default=30)
@@ -590,7 +738,8 @@ def main() -> int:
     if args.gate_report:
         gate_report = json.loads(Path(args.gate_report).read_text(encoding="utf-8"))
         query_sets = gate_report.get("semantic_regression", {}).get("query_sets", {})
-        state, code = _regression_gate(query_sets)
+        shape_report = gate_report.get("failure_shapes")
+        state, code = _combine_gate(query_sets, shape_report)
         print(json.dumps({
             "gate_report": str(args.gate_report),
             "regression_status": state,
@@ -598,12 +747,36 @@ def main() -> int:
         }, ensure_ascii=False))
         return code
 
+    if args.failure_shapes_only or args.failure_shapes_no_keyword:
+        if args.failure_shapes_only and args.failure_shapes_no_keyword:
+            raise ValueError("失败形状开关模式不能同时开启")
+        api = _load_api_module("hybrid_eval_api_failure_shapes")
+        shape_report = run_failure_shape_gate(
+            api,
+            Path(args.failure_shape_fixture),
+            keyword_enabled=not args.failure_shapes_no_keyword,
+        )
+        _write_json(Path(args.failure_report_out), shape_report)
+        print(json.dumps({
+            "failure_shape_report": str(args.failure_report_out),
+            "status": shape_report["status"],
+            "case_count": shape_report["case_count"],
+            "exit_code": shape_report["exit_code"],
+        }, ensure_ascii=False))
+        return int(shape_report["exit_code"])
+
     eval_dir = Path(args.eval_dir)
     report: dict[str, Any] = {
         "version": 1,
         "tool": "07_hybrid_eval.py",
         "contains_real_names": False,
     }
+    shape_api = _load_api_module("hybrid_eval_api_failure_shapes")
+    report["failure_shapes"] = run_failure_shape_gate(
+        shape_api,
+        Path(args.failure_shape_fixture),
+        keyword_enabled=True,
+    )
     if not args.skip_proprietary:
         api = _load_api_module("hybrid_eval_api_proprietary")
         report["proprietary"] = run_proprietary(
@@ -626,16 +799,21 @@ def main() -> int:
             Path(args.baseline_snapshot) if args.baseline_snapshot else None,
             args.write_baseline,
         )
-    state, code = _regression_gate(
-        report.get("semantic_regression", {}).get("query_sets", {})
+    state, code = _combine_gate(
+        report.get("semantic_regression", {}).get("query_sets", {}),
+        report.get("failure_shapes"),
     )
     report["regression_status"] = state
     report["regression_exit_code"] = code
+    if "failure_shapes" in report:
+        report["failure_shape_status"] = report["failure_shapes"]["status"]
+        report["failure_shape_exit_code"] = report["failure_shapes"]["exit_code"]
     _write_json(Path(args.report_out), report)
     print(json.dumps({
         "report": str(args.report_out),
         "proprietary_sample_count": report.get("proprietary", {}).get("sample_count"),
         "semantic_query_sets": sorted(report.get("semantic_regression", {}).get("query_sets", {})),
+        "failure_shape_status": report.get("failure_shape_status", "skipped"),
         "regression_status": state,
         "exit_code": code,
     }, ensure_ascii=False))

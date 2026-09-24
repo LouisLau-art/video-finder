@@ -12,6 +12,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/07_hybrid_eval.py"
+FAILURE_FIXTURE = ROOT / "eval_fixtures/real_failure_shapes.json"
 
 
 def _load_eval_module():
@@ -197,3 +198,63 @@ def test_index_signature_changes_with_metadata_content_but_not_order():
     assert same == original
     assert changed != original
     assert "metadata_sha256=" in original
+
+
+def test_failure_shape_fixture_uses_only_neutral_placeholders():
+    payload = json.loads(FAILURE_FIXTURE.read_text(encoding="utf-8"))
+    allowed_shapes = {
+        "proper_name_unmapped",
+        "filename_not_exact",
+        "parent_only",
+        "generic_overlap",
+    }
+    cases = payload["cases"]
+    fixtures = payload["fixtures"]
+    assert {case["failure_shape"] for case in cases} == allowed_shapes
+    assert len(cases) == 4
+    assert len(fixtures) == 4
+    for case in cases:
+        assert case["query"].startswith("placeholder_")
+        assert case["expected_target_video_id"].startswith("fixture_")
+        assert case["fixture_id"].startswith("fixture_")
+        assert case["construction"]
+    for fixture in fixtures:
+        for frame in fixture["frames"]:
+            assert frame["video_id"].startswith("fixture_")
+            assert frame["video_name"].startswith("placeholder_")
+            assert frame["relpath"].startswith("placeholder_")
+            assert frame["share"].startswith("placeholder_")
+
+
+def test_failure_shape_entry_passes_on_and_fails_without_keyword():
+    output = ROOT / "eval_local/failure_shape_test_report.json"
+    on = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--failure-shapes-only",
+            "--failure-report-out",
+            str(output),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    off = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--failure-shapes-no-keyword",
+            "--failure-report-out",
+            str(output),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert on.returncode == 0
+    assert off.returncode == 2
+    assert "passed" in on.stdout
+    assert "negative_control_passed_gate_failed" in off.stdout

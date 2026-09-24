@@ -4,8 +4,8 @@
 把 03_search.py 的检索能力封装为标准 HTTP 接口，供 Web 前端跨域调用。
 
 接口:
-    POST /api/search          文本搜视频帧 (请求体见 SearchRequest)
-    POST /api/search-by-image 以图搜图 (multipart 表单: image 文件 + 可选 query/top_k；
+    POST /api/search          文本搜素材（视频级结果）(请求体见 SearchRequest)
+    POST /api/search-by-image 以图搜素材（multipart 表单: image 文件 + 可选 query/top_k；
                               或 JSON: {image_base64, query?, top_k?})
     GET  /api/frames/{name}   帧图片静态预览 (流式返回 jpg)
     GET  /api/health          健康检查 {"status": "ok", "frames_count": N}
@@ -34,6 +34,8 @@ import argparse
 import base64
 import importlib.util
 import io
+import json
+import os
 import time
 import urllib.parse
 from pathlib import Path
@@ -97,6 +99,43 @@ NAS_PATH_MAP: dict[str, str] = (
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 ALLOWED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 IMAGE_BASE64_KEYS = ("image_base64", "imageBase64", "image", "base64")
+
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    """读取整数环境变量；配置异常时回退到安全默认值。"""
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float, minimum: float) -> float:
+    """读取浮点环境变量；配置异常时回退到安全默认值。"""
+    try:
+        return max(minimum, float(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """读取布尔环境变量，支持常见的 0/1 开关写法。"""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+# 视频级检索的候选扩展参数：20 倍/200 条能在常见 top_k=20 时一次覆盖
+# 足够多的素材，又避免把整个帧库拉回；4 次倍增与 500ms 预算限制极端查询。
+VIDEO_LEVEL_OVERSAMPLE_FACTOR = _env_int("VIDEO_LEVEL_OVERSAMPLE_FACTOR", 20, 1)
+VIDEO_LEVEL_MIN_CANDIDATES = _env_int("VIDEO_LEVEL_MIN_CANDIDATES", 200, 1)
+VIDEO_LEVEL_MAX_EXPANSIONS = _env_int("VIDEO_LEVEL_MAX_EXPANSIONS", 4, 0)
+VIDEO_LEVEL_EXPANSION_BUDGET_MS = _env_float(
+    "VIDEO_LEVEL_EXPANSION_BUDGET_MS", 500.0, 0.0
+)
+VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED = _env_bool(
+    "VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED", True
+)
 
 # 视频 ID -> 站点内网完整路径（随 site.json 下发，本仓库不存真实值）
 
@@ -190,7 +229,7 @@ def format_time(t: float) -> str:
 
 
 def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any]:
-    """单条 chroma 命中 -> 前端契约的 result 项。"""
+    """代表帧命中 -> 前端契约的 result 项。"""
     score = max(min(float(score), 1.0), 0.0)
     video_id = str(meta.get("video_id", ""))
     video_name = f"{video_id}.mp4"
@@ -235,6 +274,83 @@ def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any
         "full_nas_uri": full_nas_uri,
         "synology_web_url": synology_web_url,
     }
+
+
+def _metadata_time(meta: dict[str, Any]) -> float:
+    """读取帧时刻；异常元数据按 0 处理，保证排序仍可执行。"""
+    try:
+        return float(meta.get("time", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _stable_meta_key(meta: dict[str, Any]) -> str:
+    """把元数据转成与字典插入顺序无关的稳定排序键。"""
+    return json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _aggregate_video_level(
+    metas: list[Any],
+    dists: list[Any],
+    ids: list[Any],
+    top_k: int,
+) -> list[tuple[int, float, dict[str, Any]]]:
+    """把帧级命中聚合为视频级结果。
+
+    先对全部帧命中按「距离、帧时刻、稳定键」重排，消除向量库在同分
+    命中时的返回顺序差异；再按素材的最佳帧名次聚合，最后只保留前
+    ``top_k`` 个素材。代表帧与素材顺序都不依赖字典或不稳定排序。
+    """
+    hits: list[dict[str, Any]] = []
+    for i, (meta_value, distance_value) in enumerate(zip(metas, dists)):
+        if meta_value is None:
+            continue
+        meta = dict(meta_value)
+        hits.append({
+            "distance": float(distance_value),
+            "time": _metadata_time(meta),
+            "stable_key": _stable_meta_key(meta),
+            "frame_id": str(ids[i]) if i < len(ids) else "",
+            "meta": meta,
+        })
+
+    hits.sort(key=lambda hit: (
+        hit["distance"],
+        hit["time"],
+        hit["stable_key"],
+        hit["frame_id"],
+    ))
+
+    # 用重排后的帧名次计算素材最佳名次，代表帧也直接从排序后的组内首项取得。
+    by_video: dict[str, list[dict[str, Any]]] = {}
+    for frame_rank, hit in enumerate(hits, 1):
+        hit["frame_rank"] = frame_rank
+        video_id = str(hit["meta"].get("video_id", ""))
+        by_video.setdefault(video_id, []).append(hit)
+
+    videos: list[tuple[int, str, dict[str, Any]]] = []
+    for video_id, frames in by_video.items():
+        representative = min(
+            frames,
+            key=lambda hit: (
+                hit["distance"],
+                hit["time"],
+                hit["stable_key"],
+                hit["frame_id"],
+            ),
+        )
+        best_frame_rank = min(hit["frame_rank"] for hit in frames)
+        videos.append((best_frame_rank, video_id, representative))
+
+    videos.sort(key=lambda item: (item[0], item[1]))
+    limit = max(1, int(top_k))
+    results: list[tuple[int, float, dict[str, Any]]] = []
+    for rank, (_best_frame_rank, _video_id, representative) in enumerate(
+        videos[:limit], 1
+    ):
+        score = 1.0 - float(representative["distance"]) / 2.0
+        results.append((rank, score, representative["meta"]))
+    return results
 
 
 def find_frame_file(filename: str) -> Path | None:
@@ -295,7 +411,7 @@ def decode_base64_image(s: str) -> bytes:
 
 
 def search_by_embedding(vec, k_want: int, label: str) -> dict[str, Any]:
-    """共用检索：特征向量 -> 前端契约响应体（文本/以图搜图共用）。
+    """共用检索：特征向量 -> 视频级前端契约响应体。
 
     vec: 1xD 或 D 维向量（list / numpy 均可）；label: 响应 data.query。
     """
@@ -307,18 +423,77 @@ def search_by_embedding(vec, k_want: int, label: str) -> dict[str, Any]:
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     arr = np.asarray(vec, dtype=np.float32).reshape(1, -1)
-    k = max(1, min(int(k_want), _CHROMA_COUNT))
-    res = col.query(
-        query_embeddings=arr.tolist(), n_results=k,
-        include=["metadatas", "distances"],
-    )
-    metas = res["metadatas"][0]
-    dists = res["distances"][0]
+
+    requested_k = max(1, int(k_want))
+    collection_count = max(1, int(_CHROMA_COUNT))
+    target_k = min(requested_k, collection_count)
+
+    # 常见查询只需一次过取；候选不足时按倍数扩展，避免全库捞取。
+    if VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED:
+        n_results = min(
+            collection_count,
+            max(
+                target_k * VIDEO_LEVEL_OVERSAMPLE_FACTOR,
+                VIDEO_LEVEL_MIN_CANDIDATES,
+            ),
+        )
+    else:
+        # 关闭扩展时保留单次 top_k 帧查询行为，聚合逻辑本身不变。
+        n_results = target_k
+    n_results = max(1, int(n_results))
+
+    expansion_started = time.perf_counter()
+    attempts = 0
+    aggregated: list[tuple[int, float, dict[str, Any]]] = []
+    stop_reason = "enough"
+
+    while True:
+        attempts += 1
+        res = col.query(
+            query_embeddings=arr.tolist(), n_results=n_results,
+            include=["metadatas", "distances"],
+        )
+        metas = (res.get("metadatas") or [[]])[0] or []
+        dists = (res.get("distances") or [[]])[0] or []
+        ids = (res.get("ids") or [[]])[0] or []
+        aggregated = _aggregate_video_level(
+            list(metas), list(dists), list(ids), requested_k
+        )
+
+        if len(aggregated) >= target_k:
+            stop_reason = "enough"
+            break
+        if not VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED:
+            stop_reason = "disabled"
+            break
+        if n_results >= collection_count:
+            stop_reason = "hard_cap"
+            break
+        if attempts > VIDEO_LEVEL_MAX_EXPANSIONS:
+            stop_reason = "max_expansions"
+            break
+        elapsed_budget_ms = (time.perf_counter() - expansion_started) * 1000
+        if elapsed_budget_ms >= VIDEO_LEVEL_EXPANSION_BUDGET_MS:
+            stop_reason = "budget"
+            break
+
+        next_n = min(collection_count, max(n_results + 1, n_results * 2))
+        if next_n <= n_results:
+            stop_reason = "hard_cap"
+            break
+        n_results = next_n
+
+    if attempts > 1:
+        # 不记录查询文本，避免把用户输入写入服务日志。
+        print(
+            "[api] 视频级候选扩展完成 "
+            f"attempts={attempts} n_results={n_results} "
+            f"unique_videos={len(aggregated)} reason={stop_reason}"
+        )
 
     results = []
-    for i, (m, d) in enumerate(zip(metas, dists), 1):
-        score = 1.0 - float(d) / 2.0  # chroma cosine distance ∈ [0,2]
-        results.append(build_result(i, score, dict(m)))
+    for rank, score, meta in aggregated:
+        results.append(build_result(rank, score, meta))
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     return {
@@ -345,7 +520,7 @@ class SearchRequest(BaseModel):
     model_config = {"extra": "ignore", "populate_by_name": True}
 
     query: str = Field(..., description="搜索文本（中文自然语言）")
-    top_k: int = Field(default=20, ge=1, le=100, description="返回前 K 个结果")
+    top_k: int = Field(default=20, ge=1, le=100, description="返回前 K 个素材")
     # 兼容 topk 别名写法
     topk: int | None = Field(default=None, ge=1, le=100, exclude=True)
 

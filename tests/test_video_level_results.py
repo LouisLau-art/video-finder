@@ -436,19 +436,108 @@ def test_typed_filename_requires_exact_match(monkeypatch):
     assert other["match_type"] == "semantic"
 
 
-def test_parent_directory_name_is_not_keyword_text(monkeypatch):
+def test_hash_directory_is_not_keyword_text(monkeypatch):
     frames = [
         _frame(
             "video_plain",
             1.0,
             "plain_1",
             filename="plain_scene.mp4",
-            relpath="private_folder/plain_scene.mp4",
+            relpath="12345678901234567890123456789012/plain_scene.mp4",
         ),
     ]
     _, client, _collection = _client_for(monkeypatch, frames, [0.1])
 
-    payload = _post_search(client, top_k=1, query="private_folder")
+    payload = _post_search(
+        client,
+        top_k=1,
+        query="12345678901234567890123456789012",
+    )
+
+    assert payload["data"]["results"][0]["match_type"] == "semantic"
+    assert payload["data"]["results"][0]["matched_text"] == ""
+
+
+def test_meaningful_parent_directory_recall_and_matched_text(monkeypatch):
+    frames = [
+        _frame("video_semantic", 1.0, "semantic_1", filename="ordinary_scene.mp4"),
+        _frame("video_other", 2.0, "other_1", filename="another_scene.mp4"),
+        _frame(
+            "video_target",
+            3.0,
+            "target_1",
+            filename="plain_scene.mp4",
+            relpath="special_series/plain_scene.mp4",
+        ),
+    ]
+    _, client, _collection = _client_for(
+        monkeypatch, frames, [0.1, 0.2, 0.3]
+    )
+
+    payload = _post_search(client, top_k=2, query="special_series")
+    target = next(
+        row for row in payload["data"]["results"]
+        if row["video_id"] == "video_target"
+    )
+
+    assert target["match_type"] == "keyword"
+    assert target["matched_text"] == "special_series"
+
+
+def test_pure_numeric_directory_is_ignored(monkeypatch):
+    frames = [
+        _frame(
+            "video_plain",
+            1.0,
+            "plain_1",
+            filename="plain_scene.mp4",
+            relpath="2024/plain_scene.mp4",
+        ),
+    ]
+    _, client, _collection = _client_for(monkeypatch, frames, [0.1])
+
+    payload = _post_search(client, top_k=1, query="2024")
+
+    assert payload["data"]["results"][0]["match_type"] == "semantic"
+    assert payload["data"]["results"][0]["matched_text"] == ""
+
+
+def test_readable_year_directory_is_matched(monkeypatch):
+    frames = [
+        _frame(
+            "video_target",
+            1.0,
+            "target_1",
+            filename="plain_scene.mp4",
+            relpath="2024年/2026春季/plain_scene.mp4",
+        ),
+    ]
+    _, client, _collection = _client_for(monkeypatch, frames, [0.1])
+
+    payload = _post_search(client, top_k=1, query="2026春季")
+    target = payload["data"]["results"][0]
+
+    assert target["match_type"] in {"keyword", "both"}
+    assert target["matched_text"] == "2026春季"
+
+
+def test_full_path_intermediate_layer_does_not_match(monkeypatch):
+    frames = [
+        _frame(
+            "video_plain",
+            1.0,
+            "plain_1",
+            filename="plain_scene.mp4",
+            relpath="meaningful_dir/plain_scene.mp4",
+        ),
+    ]
+    _, client, _collection = _client_for(monkeypatch, frames, [0.1])
+
+    payload = _post_search(
+        client,
+        top_k=1,
+        query="meaningful_dir/plain_scene",
+    )
 
     assert payload["data"]["results"][0]["match_type"] == "semantic"
     assert payload["data"]["results"][0]["matched_text"] == ""

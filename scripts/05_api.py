@@ -335,8 +335,43 @@ def _is_typed_filename(filename: str) -> bool:
     )
 
 
+def _is_meaningful_parent_segment(segment: str) -> bool:
+    """保留含可读字符的目录段；剔除纯数字、哈希和无字母符号段。"""
+    value = str(segment or "").strip()
+    if not value or value.isdigit():
+        return False
+    if re.fullmatch(r"[0-9a-f]{16,}", value, re.IGNORECASE):
+        return False
+    # 不以数字开头判断；「2024年」「2026春季」等含可读字符的段应保留。
+    return any(char.isalpha() for char in value)
+
+
+def _meaningful_parent_segments(meta: dict[str, Any]) -> tuple[str, ...]:
+    """从 relpath/video_path 拆出父目录片段，不把完整路径作为匹配文本。"""
+    raw_path = str(meta.get("relpath") or "")
+    if not raw_path:
+        raw_path = str(meta.get("video_path") or "")
+    parts = [
+        part.strip()
+        for part in raw_path.replace("\\", "/").split("/")
+        if part.strip() not in {"", ".", ".."}
+    ]
+    share = str(meta.get("share") or "").strip()
+    if share and parts and parts[0] == share:
+        parts = parts[1:]
+    if len(parts) <= 1:
+        return ()
+    parents: list[str] = []
+    seen: set[str] = set()
+    for part in parts[:-1]:
+        if _is_meaningful_parent_segment(part) and part not in seen:
+            seen.add(part)
+            parents.append(part)
+    return tuple(parents)
+
+
 def _build_keyword_index(metas: list[Any]) -> dict[str, dict[str, Any]]:
-    """从帧元数据构建素材级文件名索引，并保留一个稳定的回退帧。"""
+    """从帧元数据构建素材级文本索引，并保留一个稳定的回退帧。"""
     index: dict[str, dict[str, Any]] = {}
     for raw_meta in metas:
         if not isinstance(raw_meta, dict):
@@ -346,21 +381,24 @@ def _build_keyword_index(metas: list[Any]) -> dict[str, dict[str, Any]]:
         filename = _filename_stem(meta)
         if not video_id or not filename:
             continue
+        parents = _meaningful_parent_segments(meta)
         meta_key = (_metadata_time(meta), _stable_meta_key(meta))
-        filename_key = (filename, _stable_meta_key(meta))
+        text_key = (filename, parents, _stable_meta_key(meta))
         current = index.get(video_id)
         if current is None:
             index[video_id] = {
                 "filename": filename,
-                "filename_key": filename_key,
+                "parents": parents,
+                "text_key": text_key,
                 "typed": _is_typed_filename(filename),
                 "meta": meta,
                 "meta_key": meta_key,
             }
             continue
-        if filename_key < current["filename_key"]:
+        if text_key < current["text_key"]:
             current["filename"] = filename
-            current["filename_key"] = filename_key
+            current["parents"] = parents
+            current["text_key"] = text_key
             current["typed"] = _is_typed_filename(filename)
         if meta_key < current["meta_key"]:
             current["meta"] = meta
@@ -388,13 +426,17 @@ def _ensure_keyword_index(col: Any, current_count: int) -> dict[str, dict[str, A
     metas = payload.get("metadatas", []) if isinstance(payload, dict) else []
     _KEYWORD_INDEX = _build_keyword_index(list(metas or []))
     _KEYWORD_INDEX_COUNT = count
+    print(
+        "[api] 关键词索引刷新 "
+        f"frames={count} materials={len(_KEYWORD_INDEX)}"
+    )
     return _KEYWORD_INDEX
 
 
 def keyword_search(
     query: str, index: dict[str, dict[str, Any]]
 ) -> list[tuple[str, str]]:
-    """在视频级文本索引中做确定性的文件名子串/精确匹配。"""
+    """在文件名和有意义父目录片段中做确定性匹配。"""
     needle = str(query or "").strip()
     if not needle:
         return []
@@ -403,10 +445,33 @@ def keyword_search(
         filename = str(entry.get("filename") or "")
         if not filename:
             continue
-        typed = bool(entry.get("typed"))
-        hit = needle == filename if typed else needle in filename
-        if hit:
-            matches.append((video_id, filename))
+        fragments: list[tuple[str, bool]] = [
+            (filename, bool(entry.get("typed"))),
+        ]
+        fragments.extend(
+            (str(parent), False) for parent in entry.get("parents", ())
+        )
+        hit_fragments: list[str] = []
+        for fragment, is_filename in fragments:
+            if not fragment:
+                continue
+            hit = (
+                needle == fragment
+                if is_filename
+                else needle in fragment
+            )
+            if hit:
+                hit_fragments.append(fragment)
+        if hit_fragments:
+            matched_text = min(
+                hit_fragments,
+                key=lambda text: (
+                    0 if text == needle else 1,
+                    len(text),
+                    text,
+                ),
+            )
+            matches.append((video_id, matched_text))
     matches.sort(key=lambda item: (
         0 if item[1] == needle else 1,
         len(item[1]),

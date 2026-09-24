@@ -40,7 +40,7 @@ import re
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 try:
     from fastapi import FastAPI, HTTPException, Request
@@ -138,6 +138,13 @@ VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED = _env_bool(
     "VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED", True
 )
 
+# 元数据分页批次保持在 SQLite 变量上限以下；500 条是安全性与吞吐量的折中。
+METADATA_BATCH_SIZE = _env_int("VIDEO_FINDER_METADATA_BATCH_SIZE", 500, 1)
+# 索引增长期间最多每 30 秒重建一次；查询先使用旧索引，后续查询完成刷新。
+KEYWORD_INDEX_REBUILD_MIN_INTERVAL = _env_float(
+    "VIDEO_FINDER_KEYWORD_INDEX_REBUILD_INTERVAL", 30.0, 0.0
+)
+
 # 关键词通道默认开启；关闭后保留工单 01 的纯语义响应契约。
 KEYWORD_CHANNEL_ENABLED = _env_bool("VIDEO_FINDER_KEYWORD_ENABLED", True)
 # RRF 只使用名次，不把语义通道与关键词通道的分数混在一起。
@@ -162,6 +169,7 @@ _CHROMA_COUNT = 0
 # 视频级文本索引：只在内存中保存素材文件名与一个可回退的代表帧元数据。
 _KEYWORD_INDEX: dict[str, dict[str, Any]] | None = None
 _KEYWORD_INDEX_COUNT: int | None = None
+_KEYWORD_INDEX_LAST_REFRESH_AT: float | None = None
 
 
 # ---------- 复用 03_search ----------
@@ -370,7 +378,35 @@ def _meaningful_parent_segments(meta: dict[str, Any]) -> tuple[str, ...]:
     return tuple(parents)
 
 
-def _build_keyword_index(metas: list[Any]) -> dict[str, dict[str, Any]]:
+def iter_collection_metadata(
+    col: Any,
+    expected_count: int | None = None,
+    batch_size: int | None = None,
+) -> Iterator[dict[str, Any]]:
+    """按固定 offset 分页读取元数据，避免一次查询生成超大 SQL 参数集。
+
+    Chroma 的 offset 分页顺序保持原样，不对单页二次排序；调用方以传入的
+    count 作为快照边界，避免索引增长时无限追新数据。
+    """
+    size = max(1, int(batch_size or METADATA_BATCH_SIZE))
+    offset = 0
+    while expected_count is None or offset < expected_count:
+        limit = size if expected_count is None else min(size, expected_count - offset)
+        payload = col.get(include=["metadatas"], limit=limit, offset=offset)
+        raw_metas = payload.get("metadatas") if isinstance(payload, dict) else None
+        metas = raw_metas if isinstance(raw_metas, list) else []
+        if not metas:
+            break
+        for raw_meta in metas:
+            if isinstance(raw_meta, dict):
+                yield dict(raw_meta)
+        returned = len(metas)
+        offset += returned
+        if returned < limit:
+            break
+
+
+def _build_keyword_index(metas: Iterable[Any]) -> dict[str, dict[str, Any]]:
     """从帧元数据构建素材级文本索引，并保留一个稳定的回退帧。"""
     index: dict[str, dict[str, Any]] = {}
     for raw_meta in metas:
@@ -407,24 +443,37 @@ def _build_keyword_index(metas: list[Any]) -> dict[str, dict[str, Any]]:
 
 
 def _ensure_keyword_index(col: Any, current_count: int) -> dict[str, dict[str, Any]]:
-    """按集合条数变化刷新内存文本索引；无变化时直接复用。"""
-    global _KEYWORD_INDEX, _KEYWORD_INDEX_COUNT
+    """按条数变化刷新索引，并用最小间隔抑制增长期间的重复重建。
+
+    条数变化后的查询在间隔内继续使用旧索引；间隔满足后的下一次查询
+    重建当前快照，因此是最终一致而不是强一致。
+    """
+    global _KEYWORD_INDEX, _KEYWORD_INDEX_COUNT, _KEYWORD_INDEX_LAST_REFRESH_AT
     if not KEYWORD_CHANNEL_ENABLED:
         return {}
     count = int(current_count)
     if _KEYWORD_INDEX is not None and _KEYWORD_INDEX_COUNT == count:
         return _KEYWORD_INDEX
+    clock = getattr(time, "monotonic", time.perf_counter)
+    now = clock()
+    if (
+        _KEYWORD_INDEX_LAST_REFRESH_AT is not None
+        and now - _KEYWORD_INDEX_LAST_REFRESH_AT < KEYWORD_INDEX_REBUILD_MIN_INTERVAL
+    ):
+        return _KEYWORD_INDEX if _KEYWORD_INDEX is not None else {}
+    _KEYWORD_INDEX_LAST_REFRESH_AT = now
     try:
-        payload = col.get(include=["metadatas"])
+        metas = iter_collection_metadata(
+            col,
+            expected_count=count,
+            batch_size=METADATA_BATCH_SIZE,
+        )
+        new_index = _build_keyword_index(metas)
     except Exception:
-        # 关键词索引失败时仍保留语义通道可用性；保持旧 count，下一次请求继续尝试刷新。
-        if _KEYWORD_INDEX is not None:
-            return _KEYWORD_INDEX
-        _KEYWORD_INDEX = {}
-        _KEYWORD_INDEX_COUNT = count
-        return _KEYWORD_INDEX
-    metas = payload.get("metadatas", []) if isinstance(payload, dict) else []
-    _KEYWORD_INDEX = _build_keyword_index(list(metas or []))
+        # 关键词索引失败时仍保留语义通道可用性；旧索引和旧 count 保持不变，
+        # 下一次查询在节流间隔结束后继续尝试刷新。
+        return _KEYWORD_INDEX if _KEYWORD_INDEX is not None else {}
+    _KEYWORD_INDEX = new_index
     _KEYWORD_INDEX_COUNT = count
     print(
         "[api] 关键词索引刷新 "

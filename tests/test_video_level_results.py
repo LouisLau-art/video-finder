@@ -91,9 +91,11 @@ class _FakeCollection:
     def count(self):
         return len(self.frames)
 
-    def get(self, include=None):
+    def get(self, include=None, limit=None, offset=0):
         assert include == ["metadatas"]
-        return {"metadatas": [dict(meta) for meta in self.frames]}
+        start = max(0, int(offset))
+        end = len(self.frames) if limit is None else start + max(0, int(limit))
+        return {"metadatas": [dict(meta) for meta in self.frames[start:end]]}
 
 
 def _client_for(monkeypatch, frames, distances, orders=None):
@@ -307,7 +309,11 @@ def test_candidate_expansion_respects_time_budget(monkeypatch):
         clock[0] += 0.06
         return value
 
-    monkeypatch.setattr(api, "time", SimpleNamespace(perf_counter=tick))
+    monkeypatch.setattr(
+        api,
+        "time",
+        SimpleNamespace(perf_counter=tick, monotonic=tick),
+    )
 
     payload = _post_search(client, top_k=10)
 
@@ -547,9 +553,10 @@ def test_keyword_index_refreshes_after_collection_growth(monkeypatch):
     frames = [
         _frame("video_old", 1.0, "old_1", filename="old_event.mp4"),
     ]
-    _, client, collection = _client_for(
+    api, client, collection = _client_for(
         monkeypatch, frames, [0.1], orders=[[0]]
     )
+    monkeypatch.setattr(api, "KEYWORD_INDEX_REBUILD_MIN_INTERVAL", 0.0)
 
     first = _post_search(client, top_k=1, query="old_event")
     assert first["data"]["results"][0]["video_id"] == "video_old"

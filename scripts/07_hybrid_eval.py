@@ -15,6 +15,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
@@ -301,8 +302,13 @@ def _coverage_ledger(index: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
 
 def _load_metadata(api: Any, col: Any) -> list[dict[str, Any]]:
-    payload = col.get(include=["metadatas"])
-    return [dict(item) for item in (payload.get("metadatas") or []) if isinstance(item, dict)]
+    return list(
+        api.iter_collection_metadata(
+            col,
+            expected_count=int(col.count()),
+            batch_size=api.METADATA_BATCH_SIZE,
+        )
+    )
 
 
 def _metadata_digest(metas: list[dict[str, Any]]) -> str:
@@ -369,6 +375,10 @@ def run_proprietary(
     m3 = api.load_search_module()
     metas = _load_metadata(api, col)
     index = api._build_keyword_index(metas)
+    # 复用刚读到的分页快照，避免评测阶段再次全量读取同一份元数据。
+    api._KEYWORD_INDEX = index
+    api._KEYWORD_INDEX_COUNT = len(metas)
+    api._KEYWORD_INDEX_LAST_REFRESH_AT = time.monotonic()
     cases = _build_proprietary_cases(index, filename_limit, parent_limit, generic_limit)
     _write_json(cases_path, {
         "version": 1,
@@ -561,10 +571,12 @@ class _FixtureCollection:
     def count(self) -> int:
         return len(self.frames)
 
-    def get(self, include=None):
+    def get(self, include=None, limit=None, offset=0):
         if include != ["metadatas"]:
             raise AssertionError("失败形状夹具只允许读取元数据")
-        return {"metadatas": [dict(frame) for frame in self.frames]}
+        start = max(0, int(offset))
+        end = len(self.frames) if limit is None else start + max(0, int(limit))
+        return {"metadatas": [dict(frame) for frame in self.frames[start:end]]}
 
     def query(self, *, query_embeddings, n_results, include):
         if include != ["metadatas", "distances"]:
@@ -608,6 +620,7 @@ def run_failure_shape_gate(
         "count": api._CHROMA_COUNT,
         "keyword_index": api._KEYWORD_INDEX,
         "keyword_index_count": api._KEYWORD_INDEX_COUNT,
+        "keyword_index_last_refresh": api._KEYWORD_INDEX_LAST_REFRESH_AT,
         "keyword_enabled": api.KEYWORD_CHANNEL_ENABLED,
     }
     rows: list[dict[str, Any]] = []
@@ -623,6 +636,7 @@ def run_failure_shape_gate(
             api._CHROMA_COUNT = collection.count()
             api._KEYWORD_INDEX = None
             api._KEYWORD_INDEX_COUNT = None
+            api._KEYWORD_INDEX_LAST_REFRESH_AT = None
             api.KEYWORD_CHANNEL_ENABLED = keyword_enabled
             top_k = int(fixture.get("top_k", 3))
             vector = api._ENCODER.encode_texts([str(case["query"])])[0]
@@ -649,6 +663,7 @@ def run_failure_shape_gate(
         api._CHROMA_COUNT = saved["count"]
         api._KEYWORD_INDEX = saved["keyword_index"]
         api._KEYWORD_INDEX_COUNT = saved["keyword_index_count"]
+        api._KEYWORD_INDEX_LAST_REFRESH_AT = saved["keyword_index_last_refresh"]
         api.KEYWORD_CHANNEL_ENABLED = saved["keyword_enabled"]
 
     all_passed = all(row["passed"] for row in rows)

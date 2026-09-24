@@ -30,6 +30,7 @@ RESULT_FIELDS = {
     "full_nas_uri",
     "synology_web_url",
 }
+HYBRID_FIELDS = RESULT_FIELDS | {"match_type", "matched_text"}
 
 
 def _load_api_module():
@@ -42,16 +43,24 @@ def _load_api_module():
     return module
 
 
-def _frame(video_id: str, time_seconds: float, name: str) -> dict[str, Any]:
+def _frame(
+    video_id: str,
+    time_seconds: float,
+    name: str,
+    filename: str | None = None,
+    relpath: str | None = None,
+) -> dict[str, Any]:
     """构造不涉及真实文件的帧元数据。"""
+    video_name = filename or f"{video_id}.mp4"
+    relative_path = relpath or f"folder/{video_id}.mp4"
     return {
         "video_id": video_id,
-        "video_name": f"{video_id}.mp4",
+        "video_name": video_name,
         "time": time_seconds,
         "frame_path": f"virtual/{video_id}/{name}.jpg",
-        "video_path": f"test_share/folder/{video_id}.mp4",
+        "video_path": f"test_share/{relative_path}",
         "share": "test_share",
-        "relpath": f"folder/{video_id}.mp4",
+        "relpath": relative_path,
     }
 
 
@@ -79,6 +88,13 @@ class _FakeCollection:
             "distances": [[self.distances[i] for i in selected]],
         }
 
+    def count(self):
+        return len(self.frames)
+
+    def get(self, include=None):
+        assert include == ["metadatas"]
+        return {"metadatas": [dict(meta) for meta in self.frames]}
+
 
 def _client_for(monkeypatch, frames, distances, orders=None):
     pytest.importorskip("fastapi")
@@ -95,7 +111,12 @@ def _client_for(monkeypatch, frames, distances, orders=None):
             return [[0.0, 1.0, 0.0, 0.0] for _ in texts]
 
     encoder = _Encoder()
-    monkeypatch.setattr(api, "ensure_state", lambda: (encoder, collection))
+
+    def ensure_state():
+        api._CHROMA_COUNT = collection.count()
+        return encoder, collection
+
+    monkeypatch.setattr(api, "ensure_state", ensure_state)
     monkeypatch.setattr(api, "_CHROMA_COUNT", len(frames))
     monkeypatch.setattr(api, "_ENCODER_NAME", "test-encoder")
     monkeypatch.setattr(api, "APP_TRANSLATE", False)
@@ -114,10 +135,10 @@ def _client_for(monkeypatch, frames, distances, orders=None):
     return api, TestClient(api.app), collection
 
 
-def _post_search(client, *, top_k: int):
+def _post_search(client, *, top_k: int, query: str = "stable query"):
     response = client.post(
         "/api/search",
-        json={"query": "stable query", "top_k": top_k},
+        json={"query": query, "top_k": top_k},
     )
     assert response.status_code == 200
     return response.json()
@@ -330,3 +351,155 @@ def test_top_k_returns_all_videos_when_library_has_fewer(monkeypatch):
         "video_a",
         "video_b",
     ]
+
+
+def test_filename_keyword_recall_adds_keyword_only_result(monkeypatch):
+    frames = [
+        _frame("video_semantic", 1.0, "semantic_1", filename="ordinary_scene.mp4"),
+        _frame("video_other", 2.0, "other_1", filename="another_scene.mp4"),
+        _frame("video_target", 3.0, "target_1", filename="special_event.mp4"),
+    ]
+    _, client, _collection = _client_for(
+        monkeypatch, frames, [0.1, 0.2, 0.3]
+    )
+
+    payload = _post_search(client, top_k=2, query="special")
+    rows = payload["data"]["results"]
+    target = next(row for row in rows if row["video_id"] == "video_target")
+
+    assert target["match_type"] == "keyword"
+    assert target["matched_text"] == "special_event"
+    assert target["score"] == 0.0
+    assert HYBRID_FIELDS.issubset(target)
+    assert all(HYBRID_FIELDS.issubset(row) for row in rows)
+
+
+def test_description_query_keeps_pure_semantic_contract(monkeypatch):
+    frames = [
+        _frame("video_a", 1.0, "a_1", filename="scene_one.mp4"),
+        _frame("video_b", 2.0, "b_1", filename="scene_two.mp4"),
+    ]
+    _, client, _collection = _client_for(monkeypatch, frames, [0.1, 0.2])
+
+    payload = _post_search(client, top_k=2, query="跑者")
+
+    assert [row["match_type"] for row in payload["data"]["results"]] == [
+        "semantic",
+        "semantic",
+    ]
+    assert [row["matched_text"] for row in payload["data"]["results"]] == ["", ""]
+
+
+def test_rrf_keeps_keyword_and_semantic_leaders_in_top_area(monkeypatch):
+    frames = [
+        _frame("video_semantic", 1.0, "semantic_1", filename="ordinary_scene.mp4"),
+        _frame("video_target", 2.0, "target_1", filename="special_event.mp4"),
+        _frame("video_shared", 3.0, "shared_1", filename="shared_scene.mp4"),
+        _frame("video_filler", 4.0, "filler_1", filename="filler_scene.mp4"),
+    ]
+    _, client, _collection = _client_for(
+        monkeypatch, frames, [0.1, 0.2, 0.3, 0.4]
+    )
+
+    payload = _post_search(client, top_k=3, query="special")
+    rows = payload["data"]["results"]
+
+    assert [row["video_id"] for row in rows[:2]] == [
+        "video_target",
+        "video_semantic",
+    ]
+    assert rows[0]["match_type"] == "both"
+    assert rows[1]["match_type"] == "semantic"
+
+
+def test_typed_filename_requires_exact_match(monkeypatch):
+    frames = [
+        _frame("video_typed", 1.0, "typed_1", filename="OUT_0601.mp4"),
+        _frame("video_other_typed", 2.0, "typed_2", filename="OUT_06012.mp4"),
+    ]
+    _, client, _collection = _client_for(monkeypatch, frames, [0.1, 0.2])
+
+    partial = _post_search(client, top_k=2, query="0601")
+    assert all(row["match_type"] == "semantic" for row in partial["data"]["results"])
+    assert all(row["matched_text"] == "" for row in partial["data"]["results"])
+
+    exact = _post_search(client, top_k=2, query="OUT_0601")
+    exact_target = next(
+        row for row in exact["data"]["results"] if row["video_id"] == "video_typed"
+    )
+    other = next(
+        row for row in exact["data"]["results"]
+        if row["video_id"] == "video_other_typed"
+    )
+    assert exact_target["match_type"] in {"keyword", "both"}
+    assert exact_target["matched_text"] == "OUT_0601"
+    assert other["match_type"] == "semantic"
+
+
+def test_parent_directory_name_is_not_keyword_text(monkeypatch):
+    frames = [
+        _frame(
+            "video_plain",
+            1.0,
+            "plain_1",
+            filename="plain_scene.mp4",
+            relpath="private_folder/plain_scene.mp4",
+        ),
+    ]
+    _, client, _collection = _client_for(monkeypatch, frames, [0.1])
+
+    payload = _post_search(client, top_k=1, query="private_folder")
+
+    assert payload["data"]["results"][0]["match_type"] == "semantic"
+    assert payload["data"]["results"][0]["matched_text"] == ""
+
+
+def test_keyword_index_refreshes_after_collection_growth(monkeypatch):
+    frames = [
+        _frame("video_old", 1.0, "old_1", filename="old_event.mp4"),
+    ]
+    _, client, collection = _client_for(
+        monkeypatch, frames, [0.1], orders=[[0]]
+    )
+
+    first = _post_search(client, top_k=1, query="old_event")
+    assert first["data"]["results"][0]["video_id"] == "video_old"
+
+    collection.frames.append(
+        _frame("video_new", 2.0, "new_1", filename="new_event.mp4")
+    )
+    collection.distances.append(0.9)
+
+    second = _post_search(client, top_k=2, query="new_event")
+    new_row = next(
+        row for row in second["data"]["results"] if row["video_id"] == "video_new"
+    )
+    assert new_row["match_type"] == "keyword"
+    assert new_row["matched_text"] == "new_event"
+
+
+def test_keyword_switch_returns_legacy_fields_and_order(monkeypatch):
+    frames = [
+        _frame("video_first", 1.0, "first_1", filename="first_scene.mp4"),
+        _frame("video_second", 2.0, "second_1", filename="second_scene.mp4"),
+        _frame("video_target", 3.0, "target_1", filename="special_event.mp4"),
+    ]
+    api, client, _collection = _client_for(
+        monkeypatch, frames, [0.1, 0.2, 0.3]
+    )
+
+    monkeypatch.setattr(api, "KEYWORD_CHANNEL_ENABLED", False)
+    legacy = _post_search(client, top_k=2, query="special")
+    assert all(set(row) == RESULT_FIELDS for row in legacy["data"]["results"])
+    assert [row["video_id"] for row in legacy["data"]["results"]] == [
+        "video_first",
+        "video_second",
+    ]
+
+    monkeypatch.setattr(api, "KEYWORD_CHANNEL_ENABLED", True)
+    enabled = _post_search(client, top_k=2, query="special")
+    assert any(
+        row["video_id"] == "video_target" and row["match_type"] == "keyword"
+        for row in enabled["data"]["results"]
+    )
+    assert all(HYBRID_FIELDS.issubset(row) for row in enabled["data"]["results"])

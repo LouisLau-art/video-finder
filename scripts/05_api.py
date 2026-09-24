@@ -36,6 +36,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -137,6 +138,11 @@ VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED = _env_bool(
     "VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED", True
 )
 
+# 关键词通道默认开启；关闭后保留工单 01 的纯语义响应契约。
+KEYWORD_CHANNEL_ENABLED = _env_bool("VIDEO_FINDER_KEYWORD_ENABLED", True)
+# RRF 只使用名次，不把两路分数混在一起。
+RRF_K = 60
+
 # 视频 ID -> 站点内网完整路径（随 site.json 下发，本仓库不存真实值）
 
 # 由 main()/--参数写入的运行时配置（ensure_state 懒加载时读取）
@@ -152,6 +158,10 @@ _ENCODER = None
 _ENCODER_NAME = ""
 _CHROMA_COL = None
 _CHROMA_COUNT = 0
+
+# 视频级文本索引：只在内存中保存素材文件名与一个可回退的代表帧元数据。
+_KEYWORD_INDEX: dict[str, dict[str, Any]] | None = None
+_KEYWORD_INDEX_COUNT: int | None = None
 
 
 # ---------- 复用 03_search ----------
@@ -194,6 +204,13 @@ def ensure_state():
     """懒加载 encoder + chroma collection（幂等，多请求复用）。"""
     global _ENCODER, _ENCODER_NAME, _CHROMA_COL, _CHROMA_COUNT
     if _ENCODER is not None and _CHROMA_COL is not None:
+        # 索引作业可能持续写入；每请求只读取廉价 count，变化时同步候选上限。
+        try:
+            current_count = int(_CHROMA_COL.count())
+        except Exception:
+            current_count = _CHROMA_COUNT
+        if current_count != _CHROMA_COUNT:
+            _CHROMA_COUNT = current_count
         return _ENCODER, _CHROMA_COL
     import chromadb
 
@@ -287,6 +304,139 @@ def _metadata_time(meta: dict[str, Any]) -> float:
 def _stable_meta_key(meta: dict[str, Any]) -> str:
     """把元数据转成与字典插入顺序无关的稳定排序键。"""
     return json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str)
+
+
+_TYPED_FILENAME_PATTERNS = (
+    re.compile(r"^\d+$"),
+    re.compile(r"^\d{4,}[_-][A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*$", re.IGNORECASE),
+    re.compile(
+        r"^(?:OUT|IN|VID|CLIP|RAW|DSC|C)[_-]?\d{3,}"
+        r"(?:[_-][A-Za-z0-9]+)*$",
+        re.IGNORECASE,
+    ),
+    re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE),
+)
+
+
+def _filename_stem(meta: dict[str, Any]) -> str:
+    """只取元数据中的文件名部分，不把父目录加入关键词文本。"""
+    raw_name = str(meta.get("video_name") or "")
+    if not raw_name:
+        raw_name = str(meta.get("relpath") or meta.get("video_path") or "")
+    raw_name = raw_name.replace("\\", "/").rsplit("/", 1)[-1]
+    return Path(raw_name).stem if raw_name else ""
+
+
+def _is_typed_filename(filename: str) -> bool:
+    """类型化文件名只允许精确匹配，避免短数字片段误伤其它素材。"""
+    value = str(filename or "").strip()
+    return bool(
+        value and any(pattern.fullmatch(value) for pattern in _TYPED_FILENAME_PATTERNS)
+    )
+
+
+def _build_keyword_index(metas: list[Any]) -> dict[str, dict[str, Any]]:
+    """从帧元数据构建素材级文件名索引，并保留一个稳定的回退帧。"""
+    index: dict[str, dict[str, Any]] = {}
+    for raw_meta in metas:
+        if not isinstance(raw_meta, dict):
+            continue
+        meta = dict(raw_meta)
+        video_id = str(meta.get("video_id") or "")
+        filename = _filename_stem(meta)
+        if not video_id or not filename:
+            continue
+        meta_key = (_metadata_time(meta), _stable_meta_key(meta))
+        filename_key = (filename, _stable_meta_key(meta))
+        current = index.get(video_id)
+        if current is None:
+            index[video_id] = {
+                "filename": filename,
+                "filename_key": filename_key,
+                "typed": _is_typed_filename(filename),
+                "meta": meta,
+                "meta_key": meta_key,
+            }
+            continue
+        if filename_key < current["filename_key"]:
+            current["filename"] = filename
+            current["filename_key"] = filename_key
+            current["typed"] = _is_typed_filename(filename)
+        if meta_key < current["meta_key"]:
+            current["meta"] = meta
+            current["meta_key"] = meta_key
+    return index
+
+
+def _ensure_keyword_index(col: Any, current_count: int) -> dict[str, dict[str, Any]]:
+    """按集合条数变化刷新内存文本索引；无变化时直接复用。"""
+    global _KEYWORD_INDEX, _KEYWORD_INDEX_COUNT
+    if not KEYWORD_CHANNEL_ENABLED:
+        return {}
+    count = int(current_count)
+    if _KEYWORD_INDEX is not None and _KEYWORD_INDEX_COUNT == count:
+        return _KEYWORD_INDEX
+    try:
+        payload = col.get(include=["metadatas"])
+    except Exception:
+        # 关键词索引失败时仍保留语义通道可用性；保持旧 count，下一次请求继续尝试刷新。
+        if _KEYWORD_INDEX is not None:
+            return _KEYWORD_INDEX
+        _KEYWORD_INDEX = {}
+        _KEYWORD_INDEX_COUNT = count
+        return _KEYWORD_INDEX
+    metas = payload.get("metadatas", []) if isinstance(payload, dict) else []
+    _KEYWORD_INDEX = _build_keyword_index(list(metas or []))
+    _KEYWORD_INDEX_COUNT = count
+    return _KEYWORD_INDEX
+
+
+def keyword_search(
+    query: str, index: dict[str, dict[str, Any]]
+) -> list[tuple[str, str]]:
+    """在视频级文本索引中做确定性的文件名子串/精确匹配。"""
+    needle = str(query or "").strip()
+    if not needle:
+        return []
+    matches: list[tuple[str, str]] = []
+    for video_id, entry in index.items():
+        filename = str(entry.get("filename") or "")
+        if not filename:
+            continue
+        typed = bool(entry.get("typed"))
+        hit = needle == filename if typed else needle in filename
+        if hit:
+            matches.append((video_id, filename))
+    matches.sort(key=lambda item: (
+        0 if item[1] == needle else 1,
+        len(item[1]),
+        item[1],
+        item[0],
+    ))
+    return matches
+
+
+def reciprocal_rank_fusion(*rankings: Any, k: int = RRF_K) -> list[Any]:
+    """纯函数 RRF：输入各通道名次，输出按名次贡献融合后的 ID 顺序。"""
+    if len(rankings) == 1 and rankings and isinstance(rankings[0], (list, tuple)):
+        first = rankings[0]
+        if not first or isinstance(first[0], (list, tuple)):
+            rankings = tuple(first)
+    scores: dict[Any, float] = {}
+    first_order: dict[Any, int] = {}
+    denominator_base = max(1, int(k))
+    for ranking in rankings:
+        seen: set[Any] = set()
+        rank = 0
+        for item in ranking:
+            if item in seen:
+                continue
+            seen.add(item)
+            rank += 1
+            if item not in first_order:
+                first_order[item] = len(first_order)
+            scores[item] = scores.get(item, 0.0) + 1.0 / (denominator_base + rank)
+    return sorted(scores, key=lambda item: (-scores[item], first_order[item]))
 
 
 def _aggregate_video_level(
@@ -410,7 +560,12 @@ def decode_base64_image(s: str) -> bytes:
         raise ValueError(f"base64 解码失败: {e}")
 
 
-def search_by_embedding(vec, k_want: int, label: str) -> dict[str, Any]:
+def search_by_embedding(
+    vec,
+    k_want: int,
+    label: str,
+    keyword_query: str | None = None,
+) -> dict[str, Any]:
     """共用检索：特征向量 -> 视频级前端契约响应体。
 
     vec: 1xD 或 D 维向量（list / numpy 均可）；label: 响应 data.query。
@@ -425,7 +580,10 @@ def search_by_embedding(vec, k_want: int, label: str) -> dict[str, Any]:
     arr = np.asarray(vec, dtype=np.float32).reshape(1, -1)
 
     requested_k = max(1, int(k_want))
-    collection_count = max(1, int(_CHROMA_COUNT))
+    try:
+        collection_count = max(1, int(col.count()))
+    except Exception:
+        collection_count = max(1, int(_CHROMA_COUNT))
     target_k = min(requested_k, collection_count)
 
     # 常见查询只需一次过取；候选不足时按倍数扩展，避免全库捞取。
@@ -494,6 +652,42 @@ def search_by_embedding(vec, k_want: int, label: str) -> dict[str, Any]:
     results = []
     for rank, score, meta in aggregated:
         results.append(build_result(rank, score, meta))
+
+    # 关键词通道只服务文字检索；以图搜图不传 keyword_query，保持工单 01 行为。
+    if str(keyword_query or "").strip() and KEYWORD_CHANNEL_ENABLED:
+        keyword_index = _ensure_keyword_index(col, collection_count)
+        keyword_matches = keyword_search(str(keyword_query), keyword_index)
+        keyword_ids = [video_id for video_id, _matched_text in keyword_matches]
+        keyword_text_by_id = {
+            video_id: matched_text for video_id, matched_text in keyword_matches
+        }
+        semantic_by_id = {
+            str(row["video_id"]): row for row in results
+        }
+        fused_ids = reciprocal_rank_fusion(
+            [str(row["video_id"]) for row in results], keyword_ids
+        )
+        fused_results: list[dict[str, Any]] = []
+        for rank, video_id in enumerate(fused_ids[:requested_k], 1):
+            if video_id in semantic_by_id:
+                row = dict(semantic_by_id[video_id])
+            else:
+                entry = keyword_index.get(video_id)
+                if not entry:
+                    continue
+                # 关键词独有素材没有语义分数；RRF 只看名次，保留 0 分契约。
+                row = build_result(rank, 0.0, entry["meta"])
+            row["rank"] = rank
+            if video_id in keyword_text_by_id:
+                row["match_type"] = (
+                    "both" if video_id in semantic_by_id else "keyword"
+                )
+                row["matched_text"] = keyword_text_by_id[video_id]
+            else:
+                row["match_type"] = "semantic"
+                row["matched_text"] = ""
+            fused_results.append(row)
+        results = fused_results
 
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     return {
@@ -566,7 +760,7 @@ def search(req: SearchRequest) -> dict[str, Any]:
         q, _ENCODER_NAME, translate=APP_TRANSLATE
     )
     q_emb = encoder.encode_texts([resolved])
-    out = search_by_embedding(q_emb[0], k_want, q)
+    out = search_by_embedding(q_emb[0], k_want, q, keyword_query=q)
     out["data"]["elapsed_ms"] = int((time.perf_counter() - t_start) * 1000)
     return out
 

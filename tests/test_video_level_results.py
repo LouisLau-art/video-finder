@@ -643,3 +643,182 @@ def test_keyword_switch_returns_legacy_fields_and_order(monkeypatch):
         for row in enabled["data"]["results"]
     )
     assert all(HYBRID_FIELDS.issubset(row) for row in enabled["data"]["results"])
+
+
+def test_keyword_channel_weight_boundaries(monkeypatch):
+    """选择性门控的纯函数边界：0 命中、选择性、泛化、空/极小库。"""
+    api = _load_api_module()
+    boost = api.KEYWORD_BOOST_WEIGHT
+    assert boost == pytest.approx(1.25)
+
+    # 无命中不改变权重。
+    assert api._keyword_channel_weight(0, 7899) == 1.0
+    assert api._keyword_channel_weight(-3, 7899) == 1.0
+
+    # 命中数少（专有名词）→ 提权；阈值包含端点。
+    assert api._keyword_channel_weight(29, 7899) == pytest.approx(boost)
+    assert api._keyword_channel_weight(40, 7899) == pytest.approx(boost)
+    # 命中超出阈值（泛化词）→ 保持 1.0。
+    assert api._keyword_channel_weight(41, 7899) == 1.0
+
+    # 空库 / 极小库不能崩，且走绝对下限。
+    assert api._keyword_channel_weight(5, 0) == pytest.approx(boost)
+    assert api._keyword_channel_weight(5, 1) == pytest.approx(boost)
+
+    # 语料变大时阈值按比例放宽。
+    assert api._keyword_channel_weight(500, 100000) == pytest.approx(boost)
+    assert api._keyword_channel_weight(501, 100000) == 1.0
+
+
+def _legacy_rrf(rankings, k):
+    """改动前的 RRF 参考实现，仅用于回归锁对比。"""
+    scores = {}
+    first_order = {}
+    base = max(1, int(k))
+    for ranking in rankings:
+        seen = set()
+        rank = 0
+        for item in ranking:
+            if item in seen:
+                continue
+            seen.add(item)
+            rank += 1
+            if item not in first_order:
+                first_order[item] = len(first_order)
+            scores[item] = scores.get(item, 0.0) + 1.0 / (base + rank)
+    return sorted(scores, key=lambda item: (-scores[item], first_order[item]))
+
+
+def test_rrf_without_weights_matches_legacy_order(monkeypatch):
+    """回归锁：不传 weights 时，融合结果与改动前逐位一致。"""
+    api = _load_api_module()
+    cases = [
+        [["a", "b", "c", "d"], ["b", "d", "e"], ["c", "a", "e", "f"]],
+        [["x", "y"], ["y", "x"]],
+        [["only"], []],
+        [["dup", "dup", "z"], ["z", "dup"]],
+    ]
+    for rankings in cases:
+        assert api.reciprocal_rank_fusion(*rankings, k=api.RRF_K) == _legacy_rrf(
+            rankings, api.RRF_K
+        )
+        # 显式 weights=None 与全 1.0 权重都必须退化为旧行为。
+        equal_weights = tuple(1.0 for _ in rankings)
+        assert api.reciprocal_rank_fusion(
+            *rankings, k=api.RRF_K, weights=equal_weights
+        ) == _legacy_rrf(rankings, api.RRF_K)
+
+    # 单参数扁平化兼容分支。
+    flat = [["a", "b", "c"], ["b", "d"]]
+    assert api.reciprocal_rank_fusion(flat, k=api.RRF_K) == _legacy_rrf(
+        flat, api.RRF_K
+    )
+    assert api.reciprocal_rank_fusion(flat, k=api.RRF_K, weights=(1.0, 1.0)) == (
+        _legacy_rrf(flat, api.RRF_K)
+    )
+
+
+def test_rrf_applies_per_channel_weights(monkeypatch):
+    """权重确实作用于对应通道，且缺省通道按 1.0 处理。"""
+    api = _load_api_module()
+    # 关键词通道提权后，"b" 单通道贡献超过 "a"。
+    boosted = api.reciprocal_rank_fusion(["a"], ["b"], k=api.RRF_K, weights=(1.0, 1.25))
+    assert boosted[:2] == ["b", "a"]
+    # 权重长度不足时后续通道按 1.0，结果回到逐位旧行为。
+    partial = api.reciprocal_rank_fusion(
+        ["a"], ["b"], k=api.RRF_K, weights=(1.0,)
+    )
+    assert partial == _legacy_rrf([["a"], ["b"]], api.RRF_K)
+
+
+def _noise_frames():
+    """语义通道占位素材：文件名不与关键词查询匹配。"""
+    return [
+        _frame("noise_a", 1.0, "na", filename="scene_a.mp4"),
+        _frame("noise_b", 2.0, "nb", filename="scene_b.mp4"),
+        _frame("noise_c", 3.0, "nc", filename="scene_c.mp4"),
+        _frame("noise_d", 4.0, "nd", filename="scene_d.mp4"),
+        _frame("noise_e", 5.0, "ne", filename="scene_e.mp4"),
+    ]
+
+
+def test_selective_keyword_query_promotes_keyword_only_target(monkeypatch):
+    """选择性查询：语义 top_k 被噪音占满，关键词独有目标提权后挤进前 top_k。
+
+    目标只被关键词命中且在关键词通道排第 3。把权重强制回 1.0 后目标跌出
+    前 5，两个方向都断言，证明差异来自选择性提权本身。
+    """
+    frames = _noise_frames() + [
+        _frame("kw_a", 6.0, "ka", filename="clip_a.mp4", relpath="solo_series/kw_a.mp4"),
+        _frame("kw_b", 7.0, "kb", filename="clip_b.mp4", relpath="solo_series/kw_b.mp4"),
+        _frame(
+            "t_target",
+            8.0,
+            "tt",
+            filename="clip_t.mp4",
+            relpath="solo_series/t_target.mp4",
+        ),
+    ]
+    distances = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    api, client, _collection = _client_for(monkeypatch, frames, distances)
+
+    # 命中 3 个素材，占比很小 → 门控判定为提权。
+    assert api._keyword_channel_weight(3, len(frames)) == pytest.approx(
+        api.KEYWORD_BOOST_WEIGHT
+    )
+
+    boosted = _post_search(client, top_k=5, query="solo_series")
+    boosted_ids = [row["video_id"] for row in boosted["data"]["results"]]
+    target = next(row for row in boosted["data"]["results"] if row["video_id"] == "t_target")
+
+    assert "t_target" in boosted_ids
+    assert target["match_type"] == "keyword"
+    assert target["matched_text"] == "solo_series"
+
+    # 对照：同一份数据强制权重 1.0，目标从第 3 名降到前 5 之外。
+    monkeypatch.setattr(api, "KEYWORD_BOOST_WEIGHT", 1.0)
+    baseline = _post_search(client, top_k=5, query="solo_series")
+    baseline_ids = [row["video_id"] for row in baseline["data"]["results"]]
+    assert "t_target" not in baseline_ids
+    assert boosted_ids.index("t_target") < 5
+
+
+def test_generic_keyword_query_is_not_boosted(monkeypatch):
+    """泛化查询（命中超阈值）：权重保持 1.0，前 top_k 不被关键词独有结果淹没。
+
+    目标在关键词通道与选择性用例一样排第 3，唯一区别是命中数超过选择性
+    阈值；默认走 1.0 时目标跌出前 5，强行当选择性处理时才进入前 5。
+    """
+    solo = [
+        _frame("solo_001_a", 6.0, "s1", filename="clip_1.mp4", relpath="solo_series/solo_001_a.mp4"),
+        _frame("solo_002_b", 7.0, "s2", filename="clip_2.mp4", relpath="solo_series/solo_002_b.mp4"),
+        _frame("solo_003_target", 8.0, "s3", filename="clip_3.mp4", relpath="solo_series/solo_003_target.mp4"),
+    ] + [
+        _frame(
+            f"solo_{i:03d}_x",
+            9.0 + i,
+            f"s{i}",
+            filename=f"clip_{i}.mp4",
+            relpath=f"solo_series/solo_{i:03d}_x.mp4",
+        )
+        for i in range(100, 147)
+    ]
+    frames = _noise_frames() + solo
+    distances = [0.1, 0.2, 0.3, 0.4, 0.5] + [
+        0.6 + 0.001 * i for i in range(len(solo))
+    ]
+    api, client, _collection = _client_for(monkeypatch, frames, distances)
+
+    # 命中 50 个素材、超选择性下限 → 门控判定不提权。
+    assert api._keyword_channel_weight(len(solo), len(frames)) == 1.0
+
+    plain = _post_search(client, top_k=5, query="solo_series")
+    plain_ids = [row["video_id"] for row in plain["data"]["results"]]
+    assert "solo_003_target" not in plain_ids
+
+    # 对照：把该查询强行纳入选择性区间（阈值抬到命中数之上）后目标进入前 5，
+    # 证明上面的差异来自选择性门控而非数据构造。
+    monkeypatch.setattr(api, "KEYWORD_SELECTIVE_MIN_HITS", len(frames) + 1)
+    forced = _post_search(client, top_k=5, query="solo_series")
+    forced_ids = [row["video_id"] for row in forced["data"]["results"]]
+    assert "solo_003_target" in forced_ids

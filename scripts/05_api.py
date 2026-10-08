@@ -40,7 +40,7 @@ import re
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Sequence
 
 try:
     from fastapi import FastAPI, HTTPException, Request
@@ -149,6 +149,14 @@ KEYWORD_INDEX_REBUILD_MIN_INTERVAL = _env_float(
 KEYWORD_CHANNEL_ENABLED = _env_bool("VIDEO_FINDER_KEYWORD_ENABLED", True)
 # RRF 只使用名次，不把语义通道与关键词通道的分数混在一起。
 RRF_K = 60
+# 关键词通道提权系数：专有名词查询下提升关键词通道贡献，避免命中被语义噪音挤出。
+KEYWORD_BOOST_WEIGHT = _env_float("VIDEO_FINDER_KEYWORD_BOOST_WEIGHT", 1.25, 1.0)
+# 选择性门控：仅当关键词命中素材数占全库比例 <= 该比例时提权。
+KEYWORD_SELECTIVE_RATIO_MAX = _env_float(
+    "VIDEO_FINDER_KEYWORD_SELECTIVE_RATIO_MAX", 0.005, 0.0
+)
+# 选择性门控的绝对下限命中数，避免小素材库时比例阈值过于苛刻。
+KEYWORD_SELECTIVE_MIN_HITS = _env_int("VIDEO_FINDER_KEYWORD_SELECTIVE_MIN_HITS", 40, 1)
 
 # 视频 ID -> 站点内网完整路径（随 site.json 下发，本仓库不存真实值）
 
@@ -538,8 +546,37 @@ def keyword_search(
     return matches
 
 
-def reciprocal_rank_fusion(*rankings: Any, k: int = RRF_K) -> list[Any]:
-    """纯函数 RRF：输入各通道名次，输出按名次贡献融合后的 ID 顺序。"""
+def _keyword_channel_weight(hit_count: int, material_count: int) -> float:
+    """按查询选择性决定关键词通道权重。
+
+    命中素材数占整个素材库比例很小的查询（专有名词）→ 提权，避免其命中被
+    语义噪音挤出默认结果；
+    命中很多素材的泛化词（如高频目录名）→ 保持 1.0，避免关键词淹没语义通道。
+    """
+    try:
+        hits = int(hit_count)
+        materials = int(material_count)
+    except (TypeError, ValueError):
+        return 1.0
+    if hits <= 0:
+        return 1.0
+    proportional_limit = int(materials * KEYWORD_SELECTIVE_RATIO_MAX)
+    limit = max(KEYWORD_SELECTIVE_MIN_HITS, proportional_limit)
+    if hits <= limit:
+        return KEYWORD_BOOST_WEIGHT
+    return 1.0
+
+
+def reciprocal_rank_fusion(
+    *rankings: Any,
+    k: int = RRF_K,
+    weights: Sequence[float] | None = None,
+) -> list[Any]:
+    """纯函数 RRF：输入各通道名次，输出按名次贡献融合后的 ID 顺序。
+
+    ``weights`` 可选地为每一路通道提供贡献系数，权重缺省或长度不足时按
+    1.0 处理；不传时行为与旧实现逐位一致。
+    """
     if len(rankings) == 1 and rankings and isinstance(rankings[0], (list, tuple)):
         first = rankings[0]
         if not first or isinstance(first[0], (list, tuple)):
@@ -547,7 +584,11 @@ def reciprocal_rank_fusion(*rankings: Any, k: int = RRF_K) -> list[Any]:
     scores: dict[Any, float] = {}
     first_order: dict[Any, int] = {}
     denominator_base = max(1, int(k))
-    for ranking in rankings:
+    for index, ranking in enumerate(rankings):
+        if weights is not None and index < len(weights):
+            weight = float(weights[index])
+        else:
+            weight = 1.0
         seen: set[Any] = set()
         rank = 0
         for item in ranking:
@@ -557,7 +598,7 @@ def reciprocal_rank_fusion(*rankings: Any, k: int = RRF_K) -> list[Any]:
             rank += 1
             if item not in first_order:
                 first_order[item] = len(first_order)
-            scores[item] = scores.get(item, 0.0) + 1.0 / (denominator_base + rank)
+            scores[item] = scores.get(item, 0.0) + weight / (denominator_base + rank)
     return sorted(scores, key=lambda item: (-scores[item], first_order[item]))
 
 
@@ -789,7 +830,10 @@ def search_by_embedding(
         keyword_text_by_id = {
             identity: matched_text for identity, matched_text in keyword_matches
         }
-        fused_ids = reciprocal_rank_fusion(identities, keyword_ids)
+        kw_weight = _keyword_channel_weight(len(keyword_ids), len(keyword_index))
+        fused_ids = reciprocal_rank_fusion(
+            identities, keyword_ids, k=RRF_K, weights=(1.0, kw_weight)
+        )
         fused_results: list[dict[str, Any]] = []
         for rank, identity in enumerate(fused_ids[:requested_k], 1):
             if identity in semantic_by_identity:

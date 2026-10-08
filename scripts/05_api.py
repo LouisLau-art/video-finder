@@ -309,6 +309,14 @@ def _metadata_time(meta: dict[str, Any]) -> float:
         return 0.0
 
 
+def _identity(meta: dict[str, Any]) -> str:
+    """素材的全局唯一身份：优先 video_key，缺失时回退 video_id（旧集合兼容）。
+
+    历史集合（评测库、单测假数据）没有 video_key，此时与 video_id 行为一致。
+    """
+    return str(meta.get("video_key") or meta.get("video_id") or "")
+
+
 def _stable_meta_key(meta: dict[str, Any]) -> str:
     """把元数据转成与字典插入顺序无关的稳定排序键。"""
     return json.dumps(meta, sort_keys=True, ensure_ascii=False, default=str)
@@ -413,16 +421,16 @@ def _build_keyword_index(metas: Iterable[Any]) -> dict[str, dict[str, Any]]:
         if not isinstance(raw_meta, dict):
             continue
         meta = dict(raw_meta)
-        video_id = str(meta.get("video_id") or "")
+        identity = _identity(meta)
         filename = _filename_stem(meta)
-        if not video_id or not filename:
+        if not identity or not filename:
             continue
         parents = _meaningful_parent_segments(meta)
         meta_key = (_metadata_time(meta), _stable_meta_key(meta))
         text_key = (filename, parents, _stable_meta_key(meta))
-        current = index.get(video_id)
+        current = index.get(identity)
         if current is None:
-            index[video_id] = {
+            index[identity] = {
                 "filename": filename,
                 "parents": parents,
                 "text_key": text_key,
@@ -589,7 +597,7 @@ def _aggregate_video_level(
     by_video: dict[str, list[dict[str, Any]]] = {}
     for frame_rank, hit in enumerate(hits, 1):
         hit["frame_rank"] = frame_rank
-        video_id = str(hit["meta"].get("video_id", ""))
+        video_id = _identity(hit["meta"])
         by_video.setdefault(video_id, []).append(hit)
 
     videos: list[tuple[int, str, dict[str, Any]]] = []
@@ -764,39 +772,40 @@ def search_by_embedding(
         )
 
     results = []
+    identities: list[str] = []
+    semantic_by_identity: dict[str, dict[str, Any]] = {}
     for rank, score, meta in aggregated:
-        results.append(build_result(rank, score, meta))
+        row = build_result(rank, score, meta)
+        results.append(row)
+        identity = _identity(meta)
+        identities.append(identity)
+        semantic_by_identity[identity] = row
 
     # 关键词通道只服务文字检索；以图搜图不传 keyword_query，保持工单 01 行为。
     if str(keyword_query or "").strip() and KEYWORD_CHANNEL_ENABLED:
         keyword_index = _ensure_keyword_index(col, collection_count)
         keyword_matches = keyword_search(str(keyword_query), keyword_index)
-        keyword_ids = [video_id for video_id, _matched_text in keyword_matches]
+        keyword_ids = [identity for identity, _matched_text in keyword_matches]
         keyword_text_by_id = {
-            video_id: matched_text for video_id, matched_text in keyword_matches
+            identity: matched_text for identity, matched_text in keyword_matches
         }
-        semantic_by_id = {
-            str(row["video_id"]): row for row in results
-        }
-        fused_ids = reciprocal_rank_fusion(
-            [str(row["video_id"]) for row in results], keyword_ids
-        )
+        fused_ids = reciprocal_rank_fusion(identities, keyword_ids)
         fused_results: list[dict[str, Any]] = []
-        for rank, video_id in enumerate(fused_ids[:requested_k], 1):
-            if video_id in semantic_by_id:
-                row = dict(semantic_by_id[video_id])
+        for rank, identity in enumerate(fused_ids[:requested_k], 1):
+            if identity in semantic_by_identity:
+                row = dict(semantic_by_identity[identity])
             else:
-                entry = keyword_index.get(video_id)
+                entry = keyword_index.get(identity)
                 if not entry:
                     continue
                 # 关键词独有素材没有语义分数；RRF 只看名次，保留 0 分契约。
                 row = build_result(rank, 0.0, entry["meta"])
             row["rank"] = rank
-            if video_id in keyword_text_by_id:
+            if identity in keyword_text_by_id:
                 row["match_type"] = (
-                    "both" if video_id in semantic_by_id else "keyword"
+                    "both" if identity in semantic_by_identity else "keyword"
                 )
-                row["matched_text"] = keyword_text_by_id[video_id]
+                row["matched_text"] = keyword_text_by_id[identity]
             else:
                 row["match_type"] = "semantic"
                 row["matched_text"] = ""

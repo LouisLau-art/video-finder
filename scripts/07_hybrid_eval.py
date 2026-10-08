@@ -90,8 +90,25 @@ def _encode_query(api: Any, encoder: Any, m3: Any, query: str):
     return encoder.encode_texts([resolved])[0]
 
 
+def _row_identity(row: dict[str, Any]) -> str:
+    """从响应行还原素材的全局唯一身份。
+
+    优先用响应显式字段 video_key；否则从 frame_image_url 的文件名前缀取
+    （帧名 {video_key}_{stem}_{t}.jpg，前缀是 8 位十六进制）；再退 video_id。
+    这样做与索引侧 targets（video_key）保持同一 ID 空间。
+    """
+    key = str(row.get("video_key") or "").strip()
+    if key:
+        return key
+    filename = str(row.get("frame_image_url") or "").rsplit("/", 1)[-1]
+    prefix = filename.split("_", 1)[0] if filename else ""
+    if re.fullmatch(r"[0-9a-f]{8}", prefix):
+        return prefix
+    return str(row.get("video_id") or "")
+
+
 def _ranked_ids(payload: dict[str, Any]) -> list[str]:
-    return [str(row["video_id"]) for row in payload["data"]["results"]]
+    return [_row_identity(row) for row in payload["data"]["results"]]
 
 
 def _run_semantic(api: Any, vec: Any, query: str, top_k: int) -> list[str]:

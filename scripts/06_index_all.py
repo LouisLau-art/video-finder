@@ -504,6 +504,11 @@ def main() -> int:
     for v in videos:
         vkey = v["video_key"]
         st = state.get(vkey)
+        # 跳过的视频：人工判定不再处理（如磁盘不足以容纳超长录屏）。
+        # 与 failed 区分——failed 会续跑重试，skipped 需显式 --force 才会重跑。
+        if st and st.get("status") == "skipped" and not args.force:
+            n_skip += 1
+            continue
         # 续跑跳过三条件：状态 done、无“待 upsert”尾巴（崩溃残留必须重跑补向量）、
         # 帧文件齐全；失败/缺帧/强制都重跑。
         if st and st.get("status") == "done" and not st.get("pending_upsert") \
@@ -606,6 +611,7 @@ def main() -> int:
                         ids = [f"{r['video_key']}_{r['video_id']}@{r['time']:.1f}"
                                for r in keep]
                         metas = [{
+                            "video_key": r["video_key"],
                             "video_id": r["video_id"],
                             "video_name": r["video_id"] + ".mp4",
                             "time": float(r["time"]),

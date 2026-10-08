@@ -574,6 +574,50 @@ def test_keyword_index_refreshes_after_collection_growth(monkeypatch):
     assert new_row["matched_text"] == "new_event"
 
 
+def test_same_stem_different_video_key_stays_separate(monkeypatch):
+    """同名文件（同 video_id、不同 video_key）必须各自成为一条结果。
+
+    回归锁：检索层过去按非唯一的 video_id 聚合，导致同名不同目录的视频被
+    合并、部分物理文件不可检索。身份必须用全局唯一 video_key。
+    """
+    frames = [
+        {**_frame("scene", 1.0, "a_1", filename="scene.mp4"),
+         "video_key": "aaaa1111", "relpath": "dir_a/scene.mp4"},
+        {**_frame("scene", 2.0, "b_1", filename="scene.mp4"),
+         "video_key": "bbbb2222", "relpath": "dir_b/scene.mp4"},
+    ]
+    _, client, _collection = _client_for(monkeypatch, frames, [0.1, 0.2])
+
+    payload = _post_search(client, top_k=10)
+    rows = payload["data"]["results"]
+
+    assert payload["data"]["total"] == 2
+    assert len(rows) == 2
+    assert {row["nas_path"] for row in rows} == {
+        "test_share/dir_a/scene.mp4",
+        "test_share/dir_b/scene.mp4",
+    }
+
+
+def test_keyword_recall_matches_each_same_stem_file(monkeypatch):
+    """关键词命中同名文件时，两条结果都要出现，且各自的 matched_text 正确。"""
+    frames = [
+        {**_frame("scene", 1.0, "a_1", filename="scene.mp4"),
+         "video_key": "aaaa1111", "relpath": "big_event/scene.mp4"},
+        {**_frame("scene", 2.0, "b_1", filename="scene.mp4"),
+         "video_key": "bbbb2222", "relpath": "other/scene.mp4"},
+    ]
+    _, client, _collection = _client_for(monkeypatch, frames, [0.1, 0.2])
+
+    payload = _post_search(client, top_k=10, query="big_event")
+    rows = payload["data"]["results"]
+
+    assert len(rows) == 2
+    hit = next(row for row in rows if row["nas_path"] == "test_share/big_event/scene.mp4")
+    assert hit["match_type"] in {"keyword", "both"}
+    assert hit["matched_text"] == "big_event"
+
+
 def test_keyword_switch_returns_legacy_fields_and_order(monkeypatch):
     frames = [
         _frame("video_first", 1.0, "first_1", filename="first_scene.mp4"),

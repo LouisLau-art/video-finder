@@ -227,6 +227,18 @@ def build_encoder(prefer: str | None = None):
 
 # ---------- main ----------
 
+def _row_video_key(row: dict) -> str:
+    """全局唯一素材身份：优先 manifest 的 video_key，其次 md5(share/relpath)，再退 video_id。"""
+    key = str(row.get("video_key") or "")
+    if key:
+        return key
+    share = str(row.get("share") or "")
+    relpath = str(row.get("relpath") or "")
+    if relpath:
+        return hashlib.md5(f"{share}/{relpath}".encode("utf-8")).hexdigest()[:8]
+    return str(row.get("video_id") or "")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="帧 embedding + 写入本地 Chroma (CPU-only)")
     ap.add_argument("--manifest", default="frames/manifest.jsonl")
@@ -280,10 +292,10 @@ def main() -> int:
         if not keep:
             continue
         embs = encoder.encode_images(imgs)
-        ids = [f"{r['video_id']}@{r['time']:.1f}" for r in keep]
+        ids = [f"{_row_video_key(r)}_{r['video_id']}@{r['time']:.1f}" for r in keep]
         metas = [
-            {"video_id": r["video_id"], "time": float(r["time"]),
-             "frame_path": str(r["frame_path"])}
+            {"video_key": _row_video_key(r), "video_id": r["video_id"],
+             "time": float(r["time"]), "frame_path": str(r["frame_path"])}
             for r in keep
         ]
         docs = [f"{r['video_id']} @ {r['time']:.1f}s" for r in keep]

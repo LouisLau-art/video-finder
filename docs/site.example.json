@@ -9,8 +9,28 @@
     }
   },
   "shares": [
-    {"share": "//nas.local/share1", "mount": "/mnt/share1", "name": "share1"},
-    {"share": "//nas.local/share2", "mount": "/mnt/share2", "name": "share2"}
+    {
+      "share": "//nas.local/share1",
+      "mount": "/mnt/share1",
+      "name": "share1"
+    },
+    {
+      "share": "//nas.local/share2",
+      "mount": "/mnt/share2",
+      "name": "share2"
+    }
   ],
-  "tunnel": {"user": "root", "host": "relay.example.com", "remote_port": 18000, "local_port": 8000}
+  "tunnel": {
+    "user": "root",
+    "host": "relay.example.com",
+    "remote_port": 18000,
+    "local_port": 8000
+  },
+  "deploy": {
+    "user": "root",
+    "host": "<公网服务器 IP，示例>",
+    "remote_base": "/opt/<应用名>",
+    "service": "<systemd 服务名>",
+    "public_base": "https://<对外域名>"
+  }
 }

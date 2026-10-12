@@ -135,6 +135,31 @@ if [[ "$code" != "200" ]]; then
     exit 1
 fi
 
+# ---- 5.1 预热关键词索引 ----
+# health 只回条数，不触发关键词索引；冷启动后的第一个 /search 才会去全量重建
+# （17 万行元数据，约 100s），而 Nginx 60s 就 504——等于重启后第一个用户必然失败。
+# 所以这里直连本地端口打一次搜索把索引建起来（不走 Nginx，不受其超时限制），
+# 建成后再打一次确认已进到亚秒级，才算真的可对外服务。
+echo "[deploy] 预热关键词索引（冷启动首次重建约 100s）..."
+warm1="$(sshpass -f "$AUTH_FILE" ssh -o StrictHostKeyChecking=no "$TARGET" \
+    "curl -s -o /dev/null -w '%{http_code}:%{time_total}' --max-time 600 \
+       -X POST http://127.0.0.1:18000/api/search \
+       -H 'Content-Type: application/json' -d '{\"query\":\"warmup\",\"top_k\":1}'" || true)"
+echo "[deploy]   首次（预期较慢）：${warm1}"
+
+warm2="$(sshpass -f "$AUTH_FILE" ssh -o StrictHostKeyChecking=no "$TARGET" \
+    "curl -s -o /dev/null -w '%{http_code}:%{time_total}' --max-time 60 \
+       -X POST http://127.0.0.1:18000/api/search \
+       -H 'Content-Type: application/json' -d '{\"query\":\"warmup\",\"top_k\":1}'" || true)"
+echo "[deploy]   二次（应回到亚秒级）：${warm2}"
+
+if [[ "${warm2%%:*}" != "200" ]]; then
+    echo "[deploy][error] 预热后搜索仍不健康（${warm2}），用户会吃 504。" >&2
+    sshpass -f "$AUTH_FILE" ssh -o StrictHostKeyChecking=no "$TARGET" \
+        "journalctl -u '${APP_SERVICE}' --no-pager -n 20" >&2 || true
+    exit 1
+fi
+
 PUBLIC_BASE="$(cfg deploy.public_base)"
 if [[ -n "$PUBLIC_BASE" ]]; then
     echo "[deploy] 完成。公网入口：${PUBLIC_BASE}/api/health"

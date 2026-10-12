@@ -432,7 +432,8 @@ def run_processing(items: list, encoder=None, collection=None, process_one=None,
                 if consecutive >= max_fail:
                     fused = True
                     fused_this_batch = True
-        open_imgs = [im for im in open_imgs if im not in batch_imgs]
+        batch_img_ids = {id(im) for im in batch_imgs}
+        open_imgs = [im for im in open_imgs if id(im) not in batch_img_ids]
         if save is not None:
             try:
                 save(results[saved_n:])

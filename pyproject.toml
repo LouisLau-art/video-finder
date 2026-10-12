@@ -13,6 +13,9 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
 ]
 dependencies = [
+  "fastapi",
+  "uvicorn",
+  "python-multipart",
   "numpy",
   "pillow",
   "transformers",

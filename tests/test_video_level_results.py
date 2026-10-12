@@ -21,6 +21,8 @@ RESULT_FIELDS = {
     "match_percentage",
     "video_id",
     "video_name",
+    # 工单 02：图片接入后视频行也补 media_type 字段（向后兼容追加）。
+    "media_type",
     "time_seconds",
     "time_formatted",
     "duration",

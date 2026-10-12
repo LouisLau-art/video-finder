@@ -35,6 +35,7 @@ import base64
 import importlib.util
 import io
 import json
+import mimetypes
 import os
 import re
 import time
@@ -179,6 +180,13 @@ _KEYWORD_INDEX: dict[str, dict[str, Any]] | None = None
 _KEYWORD_INDEX_COUNT: int | None = None
 _KEYWORD_INDEX_LAST_REFRESH_AT: float | None = None
 
+# 元数据 path 字段推导出的额外帧/原图目录（find_frame_file 兜底候选，
+# 随关键词索引刷新而更新；固定候选 APP_FRAMES_DIRS 永远优先）。
+_EXTRA_FRAME_DIRS: list[str] = []
+
+# 健康检查的图片计数缓存：(collection_count, images_count)。
+_IMAGES_COUNT_CACHE: tuple[int, int] | None = None
+
 
 # ---------- 复用 03_search ----------
 
@@ -262,10 +270,20 @@ def format_time(t: float) -> str:
 
 
 def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any]:
-    """代表帧命中 -> 前端契约的 result 项。"""
+    """代表帧命中 -> 前端契约的 result 项。
+
+    media_type=="image" 走图片分支：时间戳字段为占位，新增尺寸字段，
+    其余字段（NAS 路径/深链/帧图 URL）与视频行共用同一套契约。
+    """
     score = max(min(float(score), 1.0), 0.0)
     video_id = str(meta.get("video_id", ""))
-    video_name = f"{video_id}.mp4"
+    is_image = str(meta.get("media_type") or "") == "image"
+    if is_image:
+        # 图片条目 video_name 已带真实扩展名（06b 入库契约），
+        # 不能像视频一样硬拼 .mp4。
+        video_name = str(meta.get("video_name") or f"{video_id}.png")
+    else:
+        video_name = f"{video_id}.mp4"
     t = float(meta.get("time", 0.0) or 0.0)
     frame_path = str(meta.get("frame_path", ""))
     filename = Path(frame_path).name
@@ -292,12 +310,38 @@ def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any
     else:
         synology_web_url = ""
     full_nas_uri = f"{NAS_HOST}/{nas_path}" if NAS_HOST else ""
+
+    if is_image:
+        width = _metadata_int(meta, "width")
+        height = _metadata_int(meta, "height")
+        resolution = (
+            f"{width}x{height}" if width > 0 and height > 0 else ""
+        )
+        return {
+            "rank": rank,
+            "score": round(score, 4),
+            "match_percentage": f"{round(score * 100)}%",
+            "video_id": video_id,
+            "video_name": video_name,
+            "media_type": "image",
+            "time_seconds": 0.0,
+            "time_formatted": "--:--",
+            "duration": "--:--",
+            "resolution": resolution,
+            "width": width,
+            "height": height,
+            "frame_image_url": f"/api/frames/{filename}",
+            "nas_path": nas_path,
+            "full_nas_uri": full_nas_uri,
+            "synology_web_url": synology_web_url,
+        }
     return {
         "rank": rank,
         "score": round(score, 4),
         "match_percentage": f"{round(score * 100)}%",
         "video_id": video_id,
         "video_name": video_name,
+        "media_type": "video",
         "time_seconds": t,
         "time_formatted": format_time(t),
         "duration": "--:--",
@@ -317,11 +361,24 @@ def _metadata_time(meta: dict[str, Any]) -> float:
         return 0.0
 
 
-def _identity(meta: dict[str, Any]) -> str:
-    """素材的全局唯一身份：优先 video_key，缺失时回退 video_id（旧集合兼容）。
+def _metadata_int(meta: dict[str, Any], key: str) -> int:
+    """读取整型元数据字段；缺失/异常按 0 处理（图片宽高等可选字段用）。"""
+    try:
+        return max(0, int(float(meta.get(key, 0) or 0)))
+    except (TypeError, ValueError):
+        return 0
 
-    历史集合（评测库、单测假数据）没有 video_key，此时与 video_id 行为一致。
+
+def _identity(meta: dict[str, Any]) -> str:
+    """素材的全局唯一身份：图片条目用 image_key，其余优先 video_key。
+
+    图片与视频同库混存，video_id（=文件名 stem）在两类素材间大量撞名；
+    image_key 与 video_key 同构（同哈希算法），聚合时天然互不串身份。
+    历史集合（评测库、单测假数据）没有 key 字段时回退 video_id，
+    与旧集合行为一致。
     """
+    if str(meta.get("media_type") or "") == "image":
+        return str(meta.get("image_key") or "")
     return str(meta.get("video_key") or meta.get("video_id") or "")
 
 
@@ -422,8 +479,15 @@ def iter_collection_metadata(
             break
 
 
-def _build_keyword_index(metas: Iterable[Any]) -> dict[str, dict[str, Any]]:
-    """从帧元数据构建素材级文本索引，并保留一个稳定的回退帧。"""
+def _build_keyword_index(
+    metas: Iterable[Any],
+    frame_dirs_out: set[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """从帧元数据构建素材级文本索引，并保留一个稳定的回退帧。
+
+    ``frame_dirs_out`` 传入时顺带收集元数据 path 字段的父目录集合
+    （供 /api/frames 兜底服务图片原图），避免二次全量扫描。
+    """
     index: dict[str, dict[str, Any]] = {}
     for raw_meta in metas:
         if not isinstance(raw_meta, dict):
@@ -433,6 +497,8 @@ def _build_keyword_index(metas: Iterable[Any]) -> dict[str, dict[str, Any]]:
         filename = _filename_stem(meta)
         if not identity or not filename:
             continue
+        if frame_dirs_out is not None:
+            frame_dirs_out.update(_metadata_frame_dirs(meta))
         parents = _meaningful_parent_segments(meta)
         meta_key = (_metadata_time(meta), _stable_meta_key(meta))
         text_key = (filename, parents, _stable_meta_key(meta))
@@ -479,18 +545,20 @@ def _ensure_keyword_index(col: Any, current_count: int) -> dict[str, dict[str, A
         return _KEYWORD_INDEX if _KEYWORD_INDEX is not None else {}
     _KEYWORD_INDEX_LAST_REFRESH_AT = now
     try:
+        frame_dirs: set[str] = set()
         metas = iter_collection_metadata(
             col,
             expected_count=count,
             batch_size=METADATA_BATCH_SIZE,
         )
-        new_index = _build_keyword_index(metas)
+        new_index = _build_keyword_index(metas, frame_dirs_out=frame_dirs)
     except Exception:
         # 关键词索引失败时仍保留语义通道可用性；旧索引和旧 count 保持不变，
         # 下一次查询在节流间隔结束后继续尝试刷新。
         return _KEYWORD_INDEX if _KEYWORD_INDEX is not None else {}
     _KEYWORD_INDEX = new_index
     _KEYWORD_INDEX_COUNT = count
+    _register_metadata_frame_dirs(frame_dirs)
     print(
         "[api] 关键词索引刷新 "
         f"frames={count} materials={len(_KEYWORD_INDEX)}"
@@ -666,12 +734,51 @@ def _aggregate_video_level(
     return results
 
 
+def _metadata_frame_dirs(meta: dict[str, Any]) -> set[str]:
+    """单条元数据 -> 帧图/原图所在目录集合（find_frame_file 兜底候选）。"""
+    path_value = str(meta.get("frame_path") or meta.get("image_path") or "")
+    if not path_value:
+        return set()
+    path = Path(path_value.replace("\\", "/"))
+    if path.is_absolute():
+        parent = path.parent
+    elif path_value.startswith("~"):
+        parent = path.expanduser().parent
+    else:
+        parent = (ROOT / path).parent
+    try:
+        return {str(parent.resolve())}
+    except OSError:
+        return set()
+
+
+def _register_metadata_frame_dirs(dirs: Iterable[str]) -> None:
+    """把元数据推导出的目录并入帧目录候选（幂等、去重、排序稳定）。
+
+    候选集无变化时跳过赋值，避免每次搜索都触发无谓的重建。
+    """
+    global _EXTRA_FRAME_DIRS
+    merged = set(_EXTRA_FRAME_DIRS)
+    for d in dirs:
+        if d:
+            merged.add(str(d))
+    new_dirs = sorted(merged)
+    if new_dirs != _EXTRA_FRAME_DIRS:
+        _EXTRA_FRAME_DIRS = new_dirs
+
+
 def find_frame_file(filename: str) -> Path | None:
-    """在配置的帧目录中按 basename 查找图片；防目录穿越。"""
+    """在配置的帧目录中按 basename 查找图片；防目录穿越。
+
+    目录候选 = APP_FRAMES_DIRS（固定列表，优先）+ 元数据里出现过的
+    path 字段父目录（兜底，覆盖图片原图所在目录）。全程只 join
+    basename，调用方传入的任何路径成分都会被剥掉。
+    """
     name = Path(filename).name  # 剥掉任何 ../ 前缀
     if not name or name in (".", ".."):
         return None
-    for d in APP_FRAMES_DIRS:
+    candidates = list(APP_FRAMES_DIRS) + list(_EXTRA_FRAME_DIRS)
+    for d in candidates:
         base = ROOT / d if not Path(d).is_absolute() else Path(d)
         p = base / name
         if p.is_file():
@@ -690,6 +797,35 @@ def count_frames() -> int:
                 if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png")
             )
     return total
+
+
+def count_indexed_images() -> int:
+    """索引中的图片条目数（健康检查可选字段）。
+
+    只复用已加载的 collection（检索发生过至少一次后才有值），不触发
+    模型/库懒加载；按库条数缓存，索引未变化时零成本返回。冷启动或
+    库不可达时返回 0，绝不影响 /api/health 可用性。
+    """
+    col = _CHROMA_COL
+    if col is None:
+        return 0
+    global _IMAGES_COUNT_CACHE
+    try:
+        total = int(col.count())
+    except Exception:
+        return _IMAGES_COUNT_CACHE[1] if _IMAGES_COUNT_CACHE else 0
+    if _IMAGES_COUNT_CACHE is not None and _IMAGES_COUNT_CACHE[0] == total:
+        return _IMAGES_COUNT_CACHE[1]
+    try:
+        images = sum(
+            1
+            for meta in iter_collection_metadata(col, expected_count=total)
+            if str(meta.get("media_type") or "") == "image"
+        )
+    except Exception:
+        return _IMAGES_COUNT_CACHE[1] if _IMAGES_COUNT_CACHE else 0
+    _IMAGES_COUNT_CACHE = (total, images)
+    return images
 
 
 def decode_image_bytes(raw: bytes):
@@ -821,6 +957,9 @@ def search_by_embedding(
         identity = _identity(meta)
         identities.append(identity)
         semantic_by_identity[identity] = row
+        # 语义命中行本身也登记帧/原图目录，关键词独有图片行（无语义分）
+        # 与关键词索引刷新失败时的兜底都靠这一步保证 /api/frames 可用。
+        _register_metadata_frame_dirs(_metadata_frame_dirs(meta))
 
     # 关键词通道只服务文字检索；以图搜图不传 keyword_query，保持工单 01 行为。
     if str(keyword_query or "").strip() and KEYWORD_CHANNEL_ENABLED:
@@ -898,7 +1037,11 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "frames_count": count_frames()}
+    return {
+        "status": "ok",
+        "frames_count": count_frames(),
+        "images_count": count_indexed_images(),
+    }
 
 
 @app.get("/api/frames/{filename}")
@@ -906,7 +1049,9 @@ def get_frame(filename: str):
     p = find_frame_file(filename)
     if p is None:
         raise HTTPException(status_code=404, detail=f"帧不存在: {filename}")
-    return FileResponse(str(p), media_type="image/jpeg")
+    # 视频帧图均为 jpg；该端点同时服务图片原图（png/webp 等），按后缀给 MIME。
+    media_type, _ = mimetypes.guess_type(p.name)
+    return FileResponse(str(p), media_type=media_type or "image/jpeg")
 
 
 @app.post("/api/search")

@@ -1,0 +1,15 @@
+# videofinder-nightly.timer — 每日 21:00 触发 videofinder-nightly.service
+#
+# Persistent=true: 工位机关机错过 21:00，下次开机自动补跑。
+# 安装方式见 videofinder-nightly.service 头部注释，或 scripts/nightly_sync.sh 头部。
+[Unit]
+Description=video-finder nightly sync timer (daily 21:00)
+
+[Timer]
+OnCalendar=*-*-* 21:00:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=videofinder-nightly.service
+
+[Install]
+WantedBy=timers.target

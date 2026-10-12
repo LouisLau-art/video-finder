@@ -1,0 +1,26 @@
+# videofinder-nightly.service — 每日夜间增量索引 + 发布（一次性任务，由 .timer 触发）
+#
+# 安装:
+#   sudo cp deploy/videofinder-nightly.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now videofinder-nightly.timer
+# 日志: journalctl -u videofinder-nightly.service（脚本自身也会 tee 到 data/logs/）
+[Unit]
+Description=video-finder nightly incremental index + publish
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=louis
+Group=louis
+WorkingDirectory=/home/louis/Projects/github/video-finder-prototype
+ExecStart=/home/louis/Projects/github/video-finder-prototype/scripts/nightly_sync.sh
+# transformers 会先 HEAD huggingface.co 校验模型更新，本机直连不通会重试约 1h；
+# 模型已完整缓存在 ~/.cache/huggingface，强制离线模式直接读缓存
+Environment=HF_HUB_OFFLINE=1
+# oneshot + 单任务，无需并发防护；脚本内部另有 flock 防手工叠跑
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

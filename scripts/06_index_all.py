@@ -93,6 +93,10 @@ DEFAULT_COLLECTION = "frames"
 # 场景检测必须整片解码，SMB 上随机 seek 很慢；先顺序拷到本地磁盘再处理实测快 ~1.5x。
 # 注意不要用 /tmp（本机是 tmpfs，占内存）。
 DEFAULT_LOCAL_SCRATCH = "data/local-runtime/scratch"
+# 拷贝前可用空间预检的默认预留量（与 06b_index_images.py 的 MIN_FREE_GB=5 同量级）。
+# 事故背景（2026-10-13）：NAS 新增 5 个 14–17GB 长录屏，3 worker 并行整片拷贝，
+# scratch 堆积 39GB+，宿主机一度只剩 27GB 可用（距写满约 10 分钟）。
+DEFAULT_SCRATCH_MIN_FREE_GB = 5.0
 
 # 连续 0 帧/失败熔断阈值（疑似 NAS 掉线时中止，避免空转写脏 state）
 MAX_CONSECUTIVE_EMPTY = 20
@@ -221,6 +225,23 @@ def check_roots_readable(roots: list[str]) -> list[str]:
     return errs
 
 
+# ---------- 磁盘保护 ----------
+
+def should_copy_to_scratch(free_bytes: int, file_size_bytes: int,
+                           reserve_bytes: int) -> bool:
+    """整片拷贝到本地 scratch 前的空间预检（纯函数，便于单测）。
+
+    判据：free - size >= reserve，即拷贝完成后剩余可用空间不低于预留值。
+    取等号允许拷贝：reserve 是拷贝后必须保住的「下限」而非严格余量，
+    正好触底仍满足约束（free 读数本身也是粗粒度值，取严格大于会误拒
+    恰好够格的场景）。
+
+    free 来自 shutil.disk_usage().free，已包含其他 worker 正在写入的部分
+    拷贝所占空间，因此并发拷贝天然被计入，无需额外的并发会计。
+    """
+    return free_bytes - file_size_bytes >= reserve_bytes
+
+
 # ---------- worker（抽帧，只在子进程跑；模块动态加载，避免 pickle 传模块对象） ----------
 
 
@@ -244,13 +265,15 @@ def _extract_job(job: dict) -> dict:
     """抽一支视频：staging 抽帧 -> 重命名搬运 -> 返回 manifest 行。
 
     job: {video_path, share, relpath, video_key, stem, frames_dir, fps,
-          max_per_scene, local_scratch}
+          max_per_scene, local_scratch, scratch_min_free_bytes}
     return: {video_key, ok, rows|error, frames}
 
     性能：场景检测必须整片解码，而 SMB 上 ffmpeg 随机 seek 极慢。
     先把整片顺序拷到本地磁盘（顺序读 ~70MB/s），再在本地解码/抽帧，
     实测比 NAS 直读快约 1.5x，且消除网络抖动导致的单帧失败。
-    拷贝失败时回退为直读原路径，不因本地磁盘问题中断整批。
+    拷贝前预检可用空间（should_copy_to_scratch）：不足则跳过本地拷贝、
+    回退 NAS 直读并打 [warn]，不因本地磁盘问题中断整批。
+    拷贝失败时同样回退为直读原路径。
     """
     vkey = job["video_key"]
     stem = job["stem"]
@@ -264,15 +287,25 @@ def _extract_job(job: dict) -> dict:
             shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir(parents=True, exist_ok=True)
 
-        # 优先拷到本地再处理；失败则回退直读（不中断）
+        # 优先拷到本地再处理；空间不足或拷贝失败则回退直读（不中断）
         src = Path(job["video_path"])
         scratch = job.get("local_scratch")
         if scratch:
             try:
                 scratch_dir = Path(scratch)
                 scratch_dir.mkdir(parents=True, exist_ok=True)
-                local_copy = scratch_dir / f"{vkey}{src.suffix}"
-                shutil.copyfile(src, local_copy)
+                file_size = src.stat().st_size
+                free_bytes = shutil.disk_usage(scratch_dir).free
+                reserve_bytes = int(job.get("scratch_min_free_bytes") or 0)
+                if should_copy_to_scratch(free_bytes, file_size, reserve_bytes):
+                    local_copy = scratch_dir / f"{vkey}{src.suffix}"
+                    shutil.copyfile(src, local_copy)
+                else:
+                    print(f"[warn] scratch 可用空间不足，跳过本地拷贝改为直读: "
+                          f"{src.name}（文件 {fmt_gb(file_size)}，"
+                          f"可用 {fmt_gb(free_bytes)}，预留 {fmt_gb(reserve_bytes)}）",
+                          file=sys.stderr)
+                    local_copy = None
             except Exception as e:  # noqa: BLE001 — 本地拷贝失败回退直读
                 print(f"[warn] 本地拷贝失败，回退直读 {src.name}: {e}",
                       file=sys.stderr)
@@ -416,6 +449,10 @@ def main() -> int:
     ap.add_argument("--local-scratch", default=DEFAULT_LOCAL_SCRATCH,
                     help="抽帧前把视频顺序拷到此本地目录再解码（提速并抗网络抖动）；"
                          "传空字符串则关闭、回退 NAS 直读")
+    ap.add_argument("--scratch-min-free-gb", type=float,
+                    default=DEFAULT_SCRATCH_MIN_FREE_GB,
+                    help="本地拷贝前后必须保住的可用空间（GB）：不足以容纳整片体积 + "
+                         "该预留时跳过本地拷贝、回退 NAS 直读，默认 5GB")
     ap.add_argument("--collection", default=DEFAULT_COLLECTION)
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个（体积升序，小样验证用）")
     ap.add_argument("--dry-run", action="store_true", help="只打印统计，不写盘")
@@ -433,6 +470,7 @@ def main() -> int:
     args = ap.parse_args()
     args.batch_size = max(int(args.batch_size), 1)
     args.memory_limit_mb = max(int(args.memory_limit_mb), 0)
+    args.scratch_min_free_gb = max(float(args.scratch_min_free_gb), 0.0)
 
     frames_dir = Path(args.frames_dir)
     manifest = Path(args.manifest) if args.manifest else frames_dir / "manifest.jsonl"
@@ -572,6 +610,7 @@ def main() -> int:
              "video_key": v["video_key"], "stem": v["stem"],
              "frames_dir": str(frames_dir),
              "local_scratch": local_scratch,
+             "scratch_min_free_bytes": int(args.scratch_min_free_gb * (1024 ** 3)),
              "fps": args.fps, "max_per_scene": args.max_per_scene} for v in todo]
     by_key = {v["video_key"]: v for v in todo}
 

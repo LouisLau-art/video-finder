@@ -1,0 +1,19 @@
+# /etc/systemd/system/vf-images.service
+# 图片全量索引（一次性任务）——独立于夜间流程，用于首次全量入库
+# 范围：0摄影图（两共享），幂等可续跑；跑完手动发布
+[Unit]
+Description=video-finder image index (full run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=louis
+Group=louis
+WorkingDirectory=/home/louis/Projects/github/video-finder-prototype
+ExecStart=/home/louis/Projects/github/video-finder-prototype/scripts/run_images_index.sh
+Environment=HF_HUB_OFFLINE=1
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

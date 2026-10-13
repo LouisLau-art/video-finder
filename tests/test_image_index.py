@@ -325,6 +325,105 @@ def test_process_image_downscales_large_side(tmp_path):
     assert meta["height"] == 1024
 
 
+# ---------- 5b. 网页缩略图（thumb_path） ----------
+
+def test_thumbnail_generated_bounded_and_webp(tmp_path):
+    """缩略图：最长边限到 512、输出 WebP、保持宽高比、写入 {image_key}.webp。"""
+    module = _load_module()
+    pytest.importorskip("PIL")
+    from PIL import Image
+    import io
+
+    img = Image.new("RGB", (2048, 1024), (10, 120, 200))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    img_path = tmp_path / "wide.jpg"
+    img_path.write_bytes(buf.getvalue())
+    item = {
+        "image_path": str(img_path), "share": "s", "relpath": "d/wide.jpg",
+        "stem": "wide", "size": img_path.stat().st_size,
+        "mtime": img_path.stat().st_mtime,
+    }
+    item["image_key"] = module.image_key_of(item["share"], item["relpath"])
+    thumbs = tmp_path / "thumbs"
+
+    col = _FakeCollection()
+    result = module.process_image(item, _FakeEncoder(), col, max_side=1024,
+                                  thumbs_dir=thumbs)
+    assert result["ok"] is True
+
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["thumb_path"] == str(thumbs / f"{item['image_key']}.webp")
+    # frame_path 仍指原图（契约不变）
+    assert meta["frame_path"] == str(img_path)
+
+    from PIL import Image as PILImage
+    with PILImage.open(meta["thumb_path"]) as t:
+        assert t.format == "WEBP"
+        assert max(t.size) == 512
+        # 2048x1024 等比缩到 512x256（宽高比保持）
+        assert t.size == (512, 256)
+
+
+def test_thumbnail_idempotent_skips_when_not_older(tmp_path):
+    """缩略图已存在且不早于原图 mtime -> 不重写（mtime 保持不变）。"""
+    module = _load_module()
+    pytest.importorskip("PIL")
+    from PIL import Image
+    import io
+
+    img = Image.new("RGB", (800, 600), (1, 2, 3))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    img_path = tmp_path / "p.jpg"
+    img_path.write_bytes(buf.getvalue())
+    item = {
+        "image_path": str(img_path), "share": "s", "relpath": "d/p.jpg",
+        "stem": "p", "size": img_path.stat().st_size,
+        "mtime": img_path.stat().st_mtime,
+    }
+    item["image_key"] = module.image_key_of(item["share"], item["relpath"])
+    thumbs = tmp_path / "thumbs"
+
+    p1 = module.save_thumbnail(
+        module.open_image(str(img_path))[0], thumbs, item["image_key"],
+        item["mtime"])
+    first_mtime = Path(p1).stat().st_mtime_ns
+    # 再存一次：同 mtime 下应判定"不旧于原图"直接返回，不重写文件
+    p2 = module.save_thumbnail(
+        module.open_image(str(img_path))[0], thumbs, item["image_key"],
+        item["mtime"])
+    assert p1 == p2
+    assert Path(p2).stat().st_mtime_ns == first_mtime
+
+
+def test_thumbnail_write_failure_does_not_break_index(tmp_path, monkeypatch):
+    """缩略图写盘失败 -> 本张仍入库（thumb_path 缺省），不中断。"""
+    module = _load_module()
+    pytest.importorskip("PIL")
+
+    img_path = _make_image(tmp_path, "p.jpg")
+    item = {
+        "image_path": str(img_path), "share": "s", "relpath": "d/p.jpg",
+        "stem": "p", "size": img_path.stat().st_size,
+        "mtime": img_path.stat().st_mtime,
+    }
+    item["image_key"] = module.image_key_of(item["share"], item["relpath"])
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(module, "save_thumbnail", boom)
+    col = _FakeCollection()
+    result = module.process_image(item, _FakeEncoder(), col, max_side=1024,
+                                  thumbs_dir=tmp_path / "thumbs")
+
+    assert result["ok"] is True
+    meta = col.upserts[0]["metadatas"][0]
+    assert "thumb_path" not in meta
+    assert meta["frame_path"] == str(img_path)
+
+
 # ---------- 6. 熔断 ----------
 
 def test_fuse_after_consecutive_failures():

@@ -286,7 +286,10 @@ def build_result(rank: int, score: float, meta: dict[str, Any]) -> dict[str, Any
         video_name = f"{video_id}.mp4"
     t = float(meta.get("time", 0.0) or 0.0)
     frame_path = str(meta.get("frame_path", ""))
-    filename = Path(frame_path).name
+    # 图片行的封面优先用索引时生成的网页缩略图（thumb_path）：原图在 NAS 上，
+    # 而公网服务器不挂 NAS（ADR-0001），直接服务原图会 404。缺失时回退原图名。
+    thumb_path = str(meta.get("thumb_path", "")) if is_image else ""
+    filename = Path(thumb_path or frame_path).name
 
     # NAS 路径：全量索引的 metadata 自带 share+relpath 时直拼最准；
     # 旧评测库无该字段，走站点下发的路径映射表；最后兜底拼一级目录。

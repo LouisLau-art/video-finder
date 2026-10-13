@@ -197,6 +197,49 @@ def video_key_of(share: str, relpath: str) -> str:
     return hashlib.md5(f"{share}/{relpath}".encode("utf-8")).hexdigest()[:8]
 
 
+def select_for_mark_skip(videos: list[dict], min_gb: float = 0.0) -> list[dict]:
+    """挑出待标记跳过的视频：体积 >= min_gb（GB）；min_gb<=0 表示不限体积。"""
+    if min_gb and min_gb > 0:
+        threshold = float(min_gb) * (1024 ** 3)
+        return [v for v in videos if float(v.get("size", 0)) >= threshold]
+    return list(videos)
+
+
+def build_skip_entry(video: dict, reason: str) -> dict:
+    """构造 skipped 的 state 条目（保留体积/mtime 供对账，frames 为空）。"""
+    return {
+        "status": "skipped",
+        "mtime": video.get("mtime"),
+        "size": video.get("size"),
+        "frames": [],
+        "error": video.get("error", ""),
+        "skip_reason": reason,
+    }
+
+
+def skip_state_decision(st: dict | None, force: bool, only_skipped: bool) -> str | None:
+    """对终态做前置判定（纯函数，便于单测）。
+
+    返回：
+      "reprocess" — 重新纳入待处理
+      "skip"      — 跳过
+      None        — 交给后续常规的「帧齐全性」判定
+
+    语义：
+      - --force：一律 None（全部重跑，交由常规逻辑）。
+      - --only-skipped：只有 status=skipped 的重跑，其余（done/failed/新素材）一律跳过。
+      - 默认：status=skipped 一律跳过（人工判定不再处理，除非显式放行）；
+              其余交常规逻辑（done 且帧齐全才跳，failed 会重试）。
+    """
+    if force:
+        return None
+    if only_skipped:
+        return "reprocess" if (st and st.get("status") == "skipped") else "skip"
+    if st and st.get("status") == "skipped":
+        return "skip"
+    return None
+
+
 def check_roots_readable(roots: list[str]) -> list[str]:
     """启动前置检查：每个 --roots 根目录必须可读且非空。
 
@@ -457,6 +500,16 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 个（体积升序，小样验证用）")
     ap.add_argument("--dry-run", action="store_true", help="只打印统计，不写盘")
     ap.add_argument("--force", action="store_true", help="忽略断点状态，全部重跑")
+    ap.add_argument("--only-skipped", action="store_true",
+                    help="只处理 state 中 status=skipped 的条目（配合修复后重新纳入），"
+                         "其余已索引/done 一律照常跳过")
+    ap.add_argument("--mark-skip", action="store_true",
+                    help="不索引：把选中的视频标记为 skipped（需配 --skip-reason），"
+                         "用于人工判定暂时不处理的素材（如超长 4K 录屏超出磁盘余量）")
+    ap.add_argument("--mark-skip-min-gb", type=float, default=0.0,
+                    help="--mark-skip 时的体积下限（GB）：只标记 >= 该值的视频，0 表示不限")
+    ap.add_argument("--skip-reason", default="",
+                    help="--mark-skip 写入 state 的原因说明（空则拒绝执行）")
     ap.add_argument("--max-consecutive-empty", type=int, default=MAX_CONSECUTIVE_EMPTY,
                     help="连续 0 帧/失败达到该数即熔断停机（疑似 NAS 掉线），默认 20")
     ap.add_argument("--memory-limit-mb", type=int, default=DEFAULT_MEMORY_LIMIT_MB,
@@ -492,6 +545,31 @@ def main() -> int:
         v["video_key"] = video_key_of(v["share"], v["relpath"])
     if args.limit and args.limit > 0:
         videos = videos[:args.limit]
+
+    # ---- 标记跳过模式：不索引，只把选中视频写为 skipped（终态，除非 --only-skipped/--force）----
+    if args.mark_skip:
+        if not args.skip_reason.strip():
+            print("[error] --mark-skip 必须配 --skip-reason 说明原因，拒绝执行。",
+                  file=sys.stderr)
+            return 2
+        state = load_state(db_dir)
+        targets = select_for_mark_skip(videos, args.mark_skip_min_gb)
+        changed = 0
+        for v in targets:
+            key = v["video_key"]
+            cur = state.get(key)
+            # 已 done 的不覆盖（避免把已索引素材降级为 skipped）
+            if cur and cur.get("status") == "done":
+                continue
+            state[key] = build_skip_entry(v, args.skip_reason.strip())
+            changed += 1
+        save_state(db_dir, state)
+        total_gb = sum(float(v.get("size", 0)) for v in targets) / (1024 ** 3)
+        print(f"[mark-skip] 命中 {len(targets)} 个视频（{total_gb:.1f}GB），"
+              f"新标记/更新 {changed} 条，state 已写入 {db_dir / 'state.json'}")
+        print(f"[mark-skip] reason: {args.skip_reason.strip()}")
+        print("[mark-skip] 重新纳入：用 --only-skipped 局部重跑，或 --force 全量重跑。")
+        return 0
 
     total_bytes = sum(v["size"] for v in videos)
     if args.dry_run:
@@ -542,10 +620,17 @@ def main() -> int:
     for v in videos:
         vkey = v["video_key"]
         st = state.get(vkey)
+        # 终态判定（skipped / --only-skipped 下的 done）：纯函数给出结论。
         # 跳过的视频：人工判定不再处理（如磁盘不足以容纳超长录屏）。
-        # 与 failed 区分——failed 会续跑重试，skipped 需显式 --force 才会重跑。
-        if st and st.get("status") == "skipped" and not args.force:
+        # 与 failed 区分——failed 会续跑重试，skipped 需 --only-skipped/--force 才重跑。
+        decision = skip_state_decision(st, args.force, args.only_skipped)
+        if decision == "skip":
             n_skip += 1
+            if st:
+                skip_frames += len(st.get("frames") or [])
+            continue
+        if decision == "reprocess":
+            todo.append(v)
             continue
         # 续跑跳过三条件：状态 done、无“待 upsert”尾巴（崩溃残留必须重跑补向量）、
         # 帧文件齐全；失败/缺帧/强制都重跑。

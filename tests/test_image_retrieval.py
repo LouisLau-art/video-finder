@@ -209,6 +209,30 @@ def test_semantic_search_mixes_image_and_video_rows_with_contract(monkeypatch):
     assert video["resolution"] == "1080P"
 
 
+def test_image_row_uses_thumbnail_for_cover(monkeypatch):
+    """图片行有 thumb_path 时封面用缩略图 basename；无则回退原图（契约冻结）。"""
+    meta_with_thumb = _image_meta(
+        "imgthumb1", "shot", "shot.jpg", "shoots/shot.jpg")
+    meta_with_thumb["thumb_path"] = "/local/images_thumbs/imgthumb1.webp"
+    frames = [meta_with_thumb]
+    _, client, _collection = _client_for(monkeypatch, frames, [0.1])
+
+    payload = _post_search(client, top_k=5)
+    row = payload["data"]["results"][0]
+    assert row["media_type"] == "image"
+    # 封面指向缩略图（服务器上真实存在），而非 NAS 原图
+    assert row["frame_image_url"] == "/api/frames/imgthumb1.webp"
+    # 原图路径仍在 nas_path / frame_path 语义里可查（nas_path 未受影响）
+    assert row["nas_path"] == "test_share/shoots/shot.jpg"
+
+    # 无 thumb_path 的旧条目仍回退到原图 basename（向后兼容）
+    meta_no_thumb = _image_meta(
+        "imgold001", "old", "old.jpg", "shoots/old.jpg")
+    _, client2, _ = _client_for(monkeypatch, [meta_no_thumb], [0.2])
+    row2 = _post_search(client2, top_k=5)["data"]["results"][0]
+    assert row2["frame_image_url"] == "/api/frames/old.jpg"
+
+
 def test_image_and_video_same_stem_stay_separate(monkeypatch):
     """同 stem 的图片与视频（不同 key）聚合后必须是两条结果。"""
     frames = [

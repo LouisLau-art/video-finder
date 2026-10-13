@@ -12,6 +12,7 @@
 #      TODO(ticket-04-part2): NAS 侧删除下架机制（30 天缓冲）：
 #      检测 NAS 侧已删除图片，先标记下架（搜索不可见），连续 30 天不在时再物理移出 Chroma。
 #   4) 有新增（视频或图片）才发布 scripts/deploy_to_server.sh --all（零新增直接"今日无新增"结束）
+#      --all 含 --frames 与 --images：帧图（jpg）与图片网页缩略图（webp）合并进服务器 frames_full/
 #   5) 验收: curl deploy.host 的 /api/health（校验 frames_count > 0 且 images_count > 0），失败重试 1 次
 #   6) 结果原子落盘 data/ops/nightly_status.json
 #

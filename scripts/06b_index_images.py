@@ -63,8 +63,16 @@ DEFAULT_COLLECTION = "frames"
 MAX_CONSECUTIVE_FAILED = 20
 # 磁盘保护：写库前可用空间低于该值即停机
 MIN_FREE_GB = 5.0
-# 编码前最长边超过该值的图片等比缩小（省时省内存；缩略图服务端点直接用原图）
+# 编码前最长边超过该值的图片等比缩小（省时省内存；网页封面用生成的缩略图）
 DEFAULT_MAX_SIDE = 1024
+
+# 网页缩略图：索引时随手把已解码的图另存一份轻量副本，随索引成品发布到服务器。
+# 为什么不服务原图：原图在 NAS 上，而公网服务器不挂 NAS（见 ADR-0001），
+# 且 15 万张原图体量远超服务器磁盘。实测 512px/WebP/q80 平均约 15KB，
+# 15 万张合计约 2.2GB，可与帧目录合并发布。
+DEFAULT_THUMBS_DIR = "data/local-runtime/images_thumbs"
+THUMB_MAX_SIDE = 512
+THUMB_WEBP_QUALITY = 80
 
 
 class LowDiskSpace(RuntimeError):
@@ -227,8 +235,8 @@ def _resampling():
 def open_image(path: str, max_side: int = DEFAULT_MAX_SIDE):
     """PIL 打开图片并转 RGB；最长边超过 max_side 时等比缩小（只缩不放）。
 
-    返回 (img, 原宽, 原高)。metadata 记录原始宽高，编码用缩小后的图；
-    缩略图服务端点直接用原图文件，显示不受影响。调用方负责 close。
+    返回 (img, 原宽, 原高)。metadata 记录原始宽高，编码用缩小后的图。
+    调用方负责 close。
     """
     from PIL import Image
     with Image.open(path) as source:
@@ -267,14 +275,56 @@ def document_text(meta: dict) -> str:
     return f"{meta['video_id']} @ 0.0s (image)"
 
 
-def process_image(item: dict, encoder, collection, max_side: int = DEFAULT_MAX_SIDE) -> dict:
+def thumb_path_for(thumbs_dir: str | Path, image_key: str) -> Path:
+    """缩略图落盘路径：{thumbs_dir}/{image_key}.webp。
+
+    命名用全局唯一的 image_key（而非文件名 stem），避免同名不同目录的图互相覆盖。
+    """
+    return Path(thumbs_dir) / f"{image_key}.webp"
+
+
+def save_thumbnail(img, thumbs_dir: str | Path, image_key: str,
+                   src_mtime: float, max_side: int = THUMB_MAX_SIDE,
+                   quality: int = THUMB_WEBP_QUALITY) -> str:
+    """把（已解码的）PIL 图另存为网页缩略图 WebP；返回缩略图路径。
+
+    幂等：目标已存在且不早于原图 mtime 时不重写（与 06b 的跳过语义一致）。
+    只缩不放（与 open_image 一致）。调用方保证 img 尚未 close。
+    """
+    dst = thumb_path_for(thumbs_dir, image_key)
+    try:
+        if dst.exists() and dst.stat().st_mtime >= src_mtime:
+            return str(dst)
+    except OSError:
+        pass  # stat 失败当作未命中，照常重写
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    im = img.copy()
+    try:
+        if max_side > 0 and max(im.size) > max_side:
+            im.thumbnail((max_side, max_side), _resampling())
+        im.save(dst, "WEBP", quality=int(quality), method=6)
+    finally:
+        im.close()
+    return str(dst)
+
+
+def process_image(item: dict, encoder, collection, max_side: int = DEFAULT_MAX_SIDE,
+                  thumbs_dir: str | Path | None = None) -> dict:
     """单图完整处理：打开 -> encode -> upsert。返回 {ok, meta, state}。
 
     state 条目与 06 的 state schema 同构：{status, mtime, size, frame_path}。
+    thumbs_dir 非空时同时另存网页缩略图（失败只告警，不影响本张入库）。
     """
     img, w, h = open_image(item["image_path"], max_side)
     try:
         meta = build_meta(item, w, h)
+        if thumbs_dir:
+            try:
+                tp = save_thumbnail(img, thumbs_dir, item["image_key"], item["mtime"])
+                meta["thumb_path"] = tp
+            except Exception as e:  # noqa: BLE001 — 缩略图失败不影响入库
+                print(f"[warn] 缩略图生成失败 {item['image_path']}: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
         embs = encoder.encode_images([img])
         emb0 = embs[0]
         if hasattr(emb0, "tolist"):
@@ -543,6 +593,9 @@ def main() -> int:
                     help="连续失败达到该数即熔断停机（疑似 NAS 掉线），默认 20")
     ap.add_argument("--min-free-gb", type=float, default=MIN_FREE_GB,
                     help="写库前可用磁盘下限（GB），低于即停机，默认 5GB")
+    ap.add_argument("--thumbs-dir", default=DEFAULT_THUMBS_DIR,
+                    help="网页缩略图输出目录（随索引成品发布到服务器）；"
+                         "空字符串关闭缩略图生成")
     args = ap.parse_args()
     args.batch_size = max(int(args.batch_size), 1)
     args.max_consecutive_failures = max(int(args.max_consecutive_failures), 1)
@@ -615,6 +668,9 @@ def main() -> int:
         name=args.collection, metadata={"hnsw:space": "cosine"})
 
     by_key = {it["image_key"]: it for it in todo}
+    if args.thumbs_dir:
+        # 预建缩略图目录，使磁盘检查有实际落点（否则 disk_usage 对不存在路径会报错）
+        Path(args.thumbs_dir).mkdir(parents=True, exist_ok=True)
 
     def apply_results(results: list[dict]) -> None:
         """把批结果增量折算进 state 并原子写盘（断点安全：中断只丢当前批）。"""
@@ -635,15 +691,23 @@ def main() -> int:
         save_state(state_path, state)
 
     def prepare(item: dict, enc, col_):
-        """批内单项准备：打开+缩放+meta，返回 img 交给 run_processing 攒批。"""
+        """批内单项准备：打开+缩放+meta+缩略图，返回 img 交给 run_processing 攒批。"""
         img, w, h = open_image(item["image_path"], args.max_side)
         meta = build_meta(item, w, h)
+        try:
+            tp = save_thumbnail(img, args.thumbs_dir, item["image_key"], item["mtime"])
+            meta["thumb_path"] = tp
+        except Exception as e:  # noqa: BLE001 — 缩略图失败不影响本张入库
+            print(f"[warn] 缩略图生成失败 {item['image_path']}: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
         return {"ok": True, "img": img, "meta": meta,
                 "state": {"status": "done", "mtime": item["mtime"],
                           "size": item["size"], "frame_path": item["image_path"]}}
 
     def disk_check() -> None:
         check_disk_space(db_path, args.min_free_gb)
+        if args.thumbs_dir:
+            check_disk_space(Path(args.thumbs_dir), args.min_free_gb)
 
     plan = run_processing(
         todo, encoder=encoder, collection=col, process_one=prepare,

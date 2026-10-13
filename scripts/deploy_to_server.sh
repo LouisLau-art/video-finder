@@ -19,6 +19,7 @@
 #   scripts/deploy_to_server.sh              # 同步代码 + 重启服务（最快，日常用）
 #   scripts/deploy_to_server.sh --index      # 额外同步向量库
 #   scripts/deploy_to_server.sh --frames     # 额外同步帧缩略图
+#   scripts/deploy_to_server.sh --images     # 额外同步图片网页缩略图
 #   scripts/deploy_to_server.sh --all        # 三样全同步
 #   scripts/deploy_to_server.sh --dry-run    # 只看会传什么，不落盘
 set -euo pipefail
@@ -29,12 +30,14 @@ SITE_CLI=(python3 "${ROOT_DIR}/scripts/site_config.py")
 
 DO_INDEX=0
 DO_FRAMES=0
+DO_IMAGES=0
 DRY=""
 for arg in "$@"; do
     case "$arg" in
         --index) DO_INDEX=1 ;;
         --frames) DO_FRAMES=1 ;;
-        --all) DO_INDEX=1; DO_FRAMES=1 ;;
+        --images) DO_IMAGES=1 ;;
+        --all) DO_INDEX=1; DO_FRAMES=1; DO_IMAGES=1 ;;
         --dry-run) DRY="--dry-run" ;;
         -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "[error] 未知参数: $arg" >&2; exit 2 ;;
@@ -94,6 +97,22 @@ if [[ "$DO_FRAMES" == "1" ]]; then
     echo "[deploy] 同步 frames_full/ ..."
     rsync_to "${ROOT_DIR}/data/local-runtime/frames_full/" "frames_full" \
         --include '*/' --include '*.jpg' --exclude '*'
+fi
+
+# ---- 3b. 图片网页缩略图（可选）----
+# 合并进服务器 frames_full/（而非单独目录）的取舍：缩略图文件名是
+# {image_key}.webp，与视频帧名 {video_key}_{stem}_{t}.jpg 不会撞名；
+# 这样服务器上的 systemd 单元无需改动（--frames-dir 已指向 frames_full），
+# 避免为发布图片而修改生产服务定义。代价是两类文件混在同一目录，
+# 由文件名格式区分（.webp 为图片缩略图）。
+if [[ "$DO_IMAGES" == "1" ]]; then
+    if [[ -d "${ROOT_DIR}/data/local-runtime/images_thumbs" ]]; then
+        echo "[deploy] 同步 images_thumbs/ -> frames_full/ ..."
+        rsync_to "${ROOT_DIR}/data/local-runtime/images_thumbs/" "frames_full" \
+            --include '*/' --include '*.webp' --exclude '*'
+    else
+        echo "[deploy] 跳过 images_thumbs/（目录不存在，图片索引尚未生成缩略图）"
+    fi
 fi
 
 # ---- 4. 站点配置（NAS 路径映射等，供服务拼 NAS 链接）----

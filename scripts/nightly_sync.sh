@@ -9,6 +9,9 @@
 #      完整输出 tee 到 data/logs/nightly_<date>.log
 #   3b) 增量图片索引 scripts/06b_index_images.py（动态圈定摄影图目录，幂等），
 #      完整输出 tee 到 data/logs/nightly_images_<date>.log
+#   3c) 增量 ASR 台词转写 scripts/06c_index_asr.py（幂等，断点续跑），
+#      完整输出 tee 到 data/logs/nightly_asr_<date>.log。非阻断：失败只告警，
+#      不拦视频/图片索引与发布主链路（ASR 是可增强通道）。
 #      TODO(ticket-04-part2): NAS 侧删除下架机制（30 天缓冲）：
 #      检测 NAS 侧已删除图片，先标记下架（搜索不可见），连续 30 天不在时再物理移出 Chroma。
 #   4) 有新增（视频或图片）才发布 scripts/deploy_to_server.sh --all（零新增直接"今日无新增"结束）
@@ -53,7 +56,7 @@ done
 log() { echo "[nightly $(date '+%F %T')] $*"; }
 
 # ---- 结果字段（异常路径也要能写状态文件，见 write_status） ----
-INDEXED_NEW=""         # 数字（合计视频+图片）；拿不到统计时写 null
+INDEXED_NEW=""         # 数字（合计视频+图片+台词素材）；拿不到统计时写 null
 INDEXED_VIDEOS_NEW=""  # 视频新增数
 INDEXED_IMAGES_NEW=""  # 图片新增数
 PUBLISHED=false
@@ -62,6 +65,7 @@ HEALTH_OK=false
 TS="$(date +%Y%m%d)"
 LOG_FILE="data/logs/nightly_${TS}.log"
 IMAGE_LOG_FILE="data/logs/nightly_images_${TS}.log"
+ASR_LOG_FILE="data/logs/nightly_asr_${TS}.log"
 STATUS_FILE="data/ops/nightly_status.json"
 
 mkdir -p data/logs data/ops
@@ -215,17 +219,54 @@ fi
 INDEXED_IMAGES_NEW="$IMAGE_NEW"
 log "步骤3b完成: 图片待处理 = ${INDEXED_IMAGES_NEW:-统计失败(将记为 null)}"
 
+# ---- 3c. ASR 台词转写（限时 4h；幂等断点续跑；非阻断）----
+# 台词集合（transcripts）与帧/图片集合同库，随步骤4的 --index 一并发布。
+# 失败不拦主链路：ASR 是增强通道，索引/发布仍应照常完成。
+# 首轮回填 8000+ 素材需多次夜间窗口，故新增数按 state_asr.json 的增量统计，
+# 超时（124）但已有推进时同样计入发布触发，避免成果白跑一夜。
+ASR_STATE_FILE="data/local-runtime/index_full/state_asr.json"
+_asr_done_count() {
+    [ -f "$ASR_STATE_FILE" ] || { echo 0; return; }
+    .venv/bin/python - "$ASR_STATE_FILE" <<'PYEOF' 2>/dev/null || echo 0
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(sum(1 for v in d.values() if isinstance(v, dict) and v.get("status") in ("done", "no_audio")))
+except Exception:
+    print(0)
+PYEOF
+}
+ASR_DONE_BEFORE="$(_asr_done_count)"
+
+log "步骤3c: 运行 ASR 增量转写 scripts/06c_index_asr.py（限时 4h，非阻断）..."
+INDEX_ASR_RC=0
+timeout 4h .venv/bin/python scripts/06c_index_asr.py 2>&1 | tee "$ASR_LOG_FILE" || INDEX_ASR_RC=$?
+if [ "$INDEX_ASR_RC" -ne 0 ]; then
+    log "[nightly][warn] ASR 转写未正常结束（退出码 $INDEX_ASR_RC，日志: $ASR_LOG_FILE）"
+fi
+
+# 新增台词素材数 = 本次窗口内 state_asr 中 done/no_audio 的增量（超时也有效）
+ASR_DONE_AFTER="$(_asr_done_count)"
+ASR_NEW=$((ASR_DONE_AFTER - ASR_DONE_BEFORE))
+if [ "$ASR_NEW" -lt 0 ]; then
+    ASR_NEW=0
+fi
+log "步骤3c完成: ASR 本次新增 = ${ASR_NEW}（累计 ${ASR_DONE_AFTER}）"
+
 # ---- 合计新增数计算 ----
-if [ -n "$VIDEO_NEW" ] && [ -n "$IMAGE_NEW" ]; then
-    INDEXED_NEW=$((VIDEO_NEW + IMAGE_NEW))
-elif [ -n "$VIDEO_NEW" ]; then
-    INDEXED_NEW="$VIDEO_NEW"
-elif [ -n "$IMAGE_NEW" ]; then
-    INDEXED_NEW="$IMAGE_NEW"
+# 语义：视频、图片或台词任一有新增都触发发布。台词新增单独成立很重要：
+# ASR 首次回填时视频早已索引（VIDEO_NEW=0），但 transcripts 集合变化
+# 必须随库上传，否则新台词搜不到。
+TOTAL_PARTS=0
+[ -n "$VIDEO_NEW" ] && TOTAL_PARTS=$((TOTAL_PARTS + VIDEO_NEW))
+[ -n "$IMAGE_NEW" ] && TOTAL_PARTS=$((TOTAL_PARTS + IMAGE_NEW))
+[ -n "$ASR_NEW" ] && TOTAL_PARTS=$((TOTAL_PARTS + ASR_NEW))
+if [ "$TOTAL_PARTS" -gt 0 ]; then
+    INDEXED_NEW="$TOTAL_PARTS"
 else
     INDEXED_NEW=""
 fi
-log "素材新增合计: 视频=${INDEXED_VIDEOS_NEW:-null} 图片=${INDEXED_IMAGES_NEW:-null} 合计=${INDEXED_NEW:-null}"
+log "素材新增合计: 视频=${INDEXED_VIDEOS_NEW:-null} 图片=${INDEXED_IMAGES_NEW:-null} 台词=${ASR_NEW:-null} 合计=${INDEXED_NEW:-null}"
 
 # ---- 零新增: 跳过发布与验收，直接记"今日无新增"结束 ----
 if [ -z "$INDEXED_NEW" ] || [ "$INDEXED_NEW" -eq 0 ]; then

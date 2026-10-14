@@ -159,6 +159,14 @@ KEYWORD_SELECTIVE_RATIO_MAX = _env_float(
 # 选择性门控的绝对下限命中数，避免小素材库时比例阈值过于苛刻。
 KEYWORD_SELECTIVE_MIN_HITS = _env_int("VIDEO_FINDER_KEYWORD_SELECTIVE_MIN_HITS", 40, 1)
 
+# 台词（ASR）通道：transcripts 集合名 / 候选数 / RRF 权重均可用环境变量覆盖。
+# 新通道保守起步：权重默认 1.0、不做选择性提权；集合不存在时完全退化为两路融合。
+ASR_COLLECTION_NAME = (
+    (os.getenv("VIDEO_FINDER_ASR_COLLECTION") or "").strip() or "transcripts"
+)
+ASR_CANDIDATE_LIMIT = _env_int("VIDEO_FINDER_ASR_CANDIDATES", 50, 1)
+ASR_CHANNEL_WEIGHT = _env_float("VIDEO_FINDER_ASR_WEIGHT", 1.0, 0.0)
+
 # 视频 ID -> 站点内网完整路径（随 site.json 下发，本仓库不存真实值）
 
 # 由 main()/--参数写入的运行时配置（ensure_state 懒加载时读取）
@@ -174,6 +182,11 @@ _ENCODER = None
 _ENCODER_NAME = ""
 _CHROMA_COL = None
 _CHROMA_COUNT = 0
+
+# 台词（ASR）集合懒加载单例：集合不存在时留 None（不缓存失败结果，
+# 便于服务运行期间 ASR 全量补齐后自动生效）。
+_TRANSCRIPTS_COL = None
+_TRANSCRIPTS_CLIENT = None
 
 # 视频级文本索引：只在内存中保存素材文件名与一个可回退的代表帧元数据。
 _KEYWORD_INDEX: dict[str, dict[str, Any]] | None = None
@@ -257,6 +270,38 @@ def ensure_state():
     print(f"[api] 就绪 db={APP_DB} collection={APP_COLLECTION} "
           f"frames={n} encoder={encoder.name}")
     return _ENCODER, _CHROMA_COL
+
+
+def _ensure_transcripts_col():
+    """懒加载 ASR 台词集合（同 APP_DB 下的 transcripts）；不可用时返回 None。
+
+    台词通道是可选增强：集合尚未创建（ASR 全量还没跑）、库不可达或读取
+    异常时一律返回 None，绝不影响既有语义/关键词检索。失败结果不缓存，
+    服务运行期间 06c 补齐集合后下一次查询即可自动生效。
+    """
+    global _TRANSCRIPTS_CLIENT, _TRANSCRIPTS_COL
+    if _TRANSCRIPTS_COL is not None:
+        return _TRANSCRIPTS_COL
+    if not str(APP_DB or "").strip():
+        return None
+    if _TRANSCRIPTS_CLIENT is None:
+        try:
+            import chromadb
+            # 同路径多 client 由 chromadb 支持；与 ensure_state 的 client 相互独立。
+            _TRANSCRIPTS_CLIENT = chromadb.PersistentClient(path=APP_DB)
+        except Exception:
+            return None
+    try:
+        col = _TRANSCRIPTS_CLIENT.get_collection(ASR_COLLECTION_NAME)
+    except Exception:
+        return None
+    _TRANSCRIPTS_COL = col
+    try:
+        count = int(col.count())
+    except Exception:
+        count = -1
+    print(f"[api] 台词通道就绪 collection={ASR_COLLECTION_NAME} segments={count}")
+    return col
 
 
 # ---------- 纯函数（便于测试） ----------
@@ -737,6 +782,82 @@ def _aggregate_video_level(
     return results
 
 
+def _transcript_search(
+    query_vec: Any,
+    col_transcripts: Any,
+    top_n: int,
+) -> list[tuple[str, float, dict[str, Any]]]:
+    """台词向量通道：查询台词集合并聚合到素材级，返回 [(identity, score, meta)]。
+
+    同一素材的多段台词只保留距离最小（最佳）的一段作为素材代表，identity
+    去重后按距离升序输出；距离 -> 分数换算沿用 _aggregate_video_level 的
+    约定 ``score = 1.0 - distance / 2.0``。
+
+    集合为 None、为空或查询异常时返回空列表，绝不影响其它通道。
+    """
+    if col_transcripts is None:
+        return []
+    try:
+        import numpy as np
+        arr = np.asarray(query_vec, dtype=np.float32).reshape(1, -1)
+        count = int(col_transcripts.count())
+    except Exception:
+        return []
+    if count <= 0:
+        return []
+    n_results = max(1, min(int(top_n), count))
+    try:
+        res = col_transcripts.query(
+            query_embeddings=arr.tolist(),
+            n_results=n_results,
+            include=["metadatas", "distances"],
+        )
+    except Exception:
+        return []
+
+    raw_metas = (res.get("metadatas") or [[]])[0] or []
+    dists = (res.get("distances") or [[]])[0] or []
+    ids = (res.get("ids") or [[]])[0] or []
+
+    # 先按「距离、台词时刻、稳定键、文档 ID」重排，消除向量库的返回顺序差异；
+    # 再按重排后的顺序取每个素材的首段（即最佳段），素材顺序即最佳段名次。
+    hits: list[dict[str, Any]] = []
+    for i, meta_value in enumerate(raw_metas):
+        if meta_value is None:
+            continue
+        meta = dict(meta_value)
+        if not _identity(meta):
+            continue
+        try:
+            distance = float(dists[i])
+        except (IndexError, TypeError, ValueError):
+            distance = 2.0
+        hits.append({
+            "distance": distance,
+            "time": _metadata_time(meta),
+            "stable_key": _stable_meta_key(meta),
+            "doc_id": str(ids[i]) if i < len(ids) else "",
+            "meta": meta,
+        })
+    hits.sort(key=lambda hit: (
+        hit["distance"],
+        hit["time"],
+        hit["stable_key"],
+        hit["doc_id"],
+    ))
+
+    results: list[tuple[str, float, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for hit in hits:
+        identity = _identity(hit["meta"])
+        if identity in seen:
+            continue
+        seen.add(identity)
+        score = 1.0 - hit["distance"] / 2.0
+        results.append((identity, score, hit["meta"]))
+    return results
+
+
 def _metadata_frame_dirs(meta: dict[str, Any]) -> set[str]:
     """单条元数据 -> 帧图/原图所在目录集合（find_frame_file 兜底候选）。"""
     path_value = str(meta.get("frame_path") or meta.get("image_path") or "")
@@ -964,37 +1085,85 @@ def search_by_embedding(
         # 与关键词索引刷新失败时的兜底都靠这一步保证 /api/frames 可用。
         _register_metadata_frame_dirs(_metadata_frame_dirs(meta))
 
-    # 关键词通道只服务文字检索；以图搜图不传 keyword_query，保持工单 01 行为。
-    if str(keyword_query or "").strip() and KEYWORD_CHANNEL_ENABLED:
-        keyword_index = _ensure_keyword_index(col, collection_count)
-        keyword_matches = keyword_search(str(keyword_query), keyword_index)
-        keyword_ids = [identity for identity, _matched_text in keyword_matches]
-        keyword_text_by_id = {
-            identity: matched_text for identity, matched_text in keyword_matches
-        }
-        kw_weight = _keyword_channel_weight(len(keyword_ids), len(keyword_index))
-        fused_ids = reciprocal_rank_fusion(
-            identities, keyword_ids, k=RRF_K, weights=(1.0, kw_weight)
+    # 关键词与台词通道都只服务文字检索；以图搜图不传 keyword_query，保持工单 01 行为。
+    text_query = str(keyword_query or "").strip()
+    keyword_active = bool(text_query) and KEYWORD_CHANNEL_ENABLED
+
+    # 台词通道：集合不存在（ASR 全量还没跑）或查询异常时静默跳过，不影响既有检索。
+    transcript_hits: list[tuple[str, float, dict[str, Any]]] = []
+    if text_query:
+        transcript_hits = _transcript_search(
+            arr[0], _ensure_transcripts_col(), ASR_CANDIDATE_LIMIT
         )
+    transcript_ids = [identity for identity, _score, _meta in transcript_hits]
+    transcript_score_by_id = {
+        identity: score for identity, score, _meta in transcript_hits
+    }
+    transcript_meta_by_id = {
+        identity: meta for identity, _score, meta in transcript_hits
+    }
+
+    if keyword_active or transcript_ids:
+        keyword_index = (
+            _ensure_keyword_index(col, collection_count) if keyword_active else {}
+        )
+        keyword_ids: list[str] = []
+        keyword_text_by_id: dict[str, str] = {}
+        kw_weight = 1.0
+        if keyword_active:
+            keyword_matches = keyword_search(text_query, keyword_index)
+            keyword_ids = [identity for identity, _matched_text in keyword_matches]
+            keyword_text_by_id = {
+                identity: matched_text for identity, matched_text in keyword_matches
+            }
+            kw_weight = _keyword_channel_weight(len(keyword_ids), len(keyword_index))
+
+        # 语义 + 关键词 + 台词三路 RRF；台词通道不可用时通道序列与旧版逐位一致。
+        rankings: list[list[str]] = [identities]
+        weights: list[float] = [1.0]
+        if keyword_active:
+            rankings.append(keyword_ids)
+            weights.append(kw_weight)
+        if transcript_ids:
+            rankings.append(transcript_ids)
+            weights.append(ASR_CHANNEL_WEIGHT)
+        fused_ids = reciprocal_rank_fusion(*rankings, k=RRF_K, weights=tuple(weights))
+
         fused_results: list[dict[str, Any]] = []
         for rank, identity in enumerate(fused_ids[:requested_k], 1):
-            if identity in semantic_by_identity:
-                row = dict(semantic_by_identity[identity])
+            semantic_row = semantic_by_identity.get(identity)
+            keyword_text = keyword_text_by_id.get(identity)
+            transcript_meta = transcript_meta_by_id.get(identity)
+            # 台词命中优先以台词段为代表：时间给台词起始秒、摘要给台词原句；
+            # 例外：语义+关键词双命中（历史 "both" 语义）保持不变。
+            if transcript_meta is not None and not (
+                semantic_row is not None and keyword_text is not None
+            ):
+                row = build_result(
+                    rank,
+                    transcript_score_by_id.get(identity, 0.0),
+                    transcript_meta,
+                )
+                # 台词段没有帧图（frame_path 属于帧图）；封面留空，契约字段仍存在。
+                row["frame_image_url"] = ""
+                match_type = "transcript"
+                matched_text = str(transcript_meta.get("text") or "")
+            elif semantic_row is not None:
+                row = dict(semantic_row)
+                if keyword_text is not None:
+                    match_type, matched_text = "both", keyword_text
+                else:
+                    match_type, matched_text = "semantic", ""
             else:
                 entry = keyword_index.get(identity)
                 if not entry:
                     continue
                 # 关键词独有素材没有语义分数；RRF 只看名次，保留 0 分契约。
                 row = build_result(rank, 0.0, entry["meta"])
+                match_type, matched_text = "keyword", keyword_text or ""
             row["rank"] = rank
-            if identity in keyword_text_by_id:
-                row["match_type"] = (
-                    "both" if identity in semantic_by_identity else "keyword"
-                )
-                row["matched_text"] = keyword_text_by_id[identity]
-            else:
-                row["match_type"] = "semantic"
-                row["matched_text"] = ""
+            row["match_type"] = match_type
+            row["matched_text"] = matched_text
             fused_results.append(row)
         results = fused_results
 

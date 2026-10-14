@@ -14,7 +14,7 @@ export HF_HUB_OFFLINE=1
 
 .venv/bin/python scripts/06b_index_images.py \
   --include-dir "0摄影图" \
-  --workers 2 \
+  --workers 5 \
   2>&1 | tee -a "$LOG"
 
 RC=${PIPESTATUS[0]}

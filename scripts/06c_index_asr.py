@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -40,11 +41,53 @@ DEFAULT_STATE = "data/local-runtime/index_full/state_asr.json"
 DEFAULT_COLLECTION = "transcripts"
 DEFAULT_SCRATCH_DIR = "data/local-runtime/scratch_asr"
 
-VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".m4v"}
+# 与 06 管线保持同一后缀集合：ASR 只应转写「会被 06 抽帧索引」的素材，
+# 否则会产出没有帧图、也搜不到画面的孤儿台词（身份对不上）。
+VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
 CLEAN_TAG_RE = re.compile(r"<\|[^|>]+(?:\|[^|>]+)*\|>")
+
+# 与 06 相同的代码依赖目录剪枝（CIFS 上枚举极慢）。
+PRUNE_DIRNAMES = {
+    "site-packages", "node_modules", "__pycache__", "venv",
+    ".tox", ".eggs", "__pypackages__", "pip-wheel-metadata",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "@eadir", "#recycle", "#snapshot",
+}
 
 # 连续失败熔断阈值
 MAX_CONSECUTIVE_FAILURES = 20
+
+
+def _load_share_map() -> dict:
+    """shares 列表 -> {mount: name}；失败返回空 dict（与 06/06b 同款）。"""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "site_config", str(SCRIPTS / "site_config.py"))
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        out: dict = {}
+        for s in mod.load().get("shares", []) or []:
+            if isinstance(s, dict) and s.get("mount") and s.get("name"):
+                out[str(s["mount"]).rstrip("/")] = str(s["name"])
+        return out
+    except Exception:
+        return {}
+
+
+SHARE_MAP = _load_share_map()
+
+
+def _default_roots() -> list[str]:
+    """--roots 默认值：site.json 的 shares 挂载点列表；无配置时退回本地默认。"""
+    if SHARE_MAP:
+        return sorted(SHARE_MAP)
+    return ["/mnt/nas"]
+
+
+def share_of(root: str) -> str:
+    """挂载点 -> 共享名；未知根目录回退用其 basename。"""
+    return SHARE_MAP.get(root.rstrip("/"), Path(root).name)
 
 
 def clean_sensevoice_tags(text: str) -> str:
@@ -190,6 +233,63 @@ class AsrTranscriber:
         return results
 
 
+def discover_local_videos(vdir: Path) -> list[tuple[str, str, Path]]:
+    """本地目录发现（--videos-dir 分支）：返回 [(share='local', rel, path)]。"""
+    out: list[tuple[str, str, Path]] = []
+    for p in sorted(vdir.rglob("*")):
+        if p.suffix.lower() in VIDEO_EXTS and not p.name.startswith("."):
+            out.append(("local", p.relative_to(vdir).as_posix(), p))
+    return out
+
+
+def discover_nas_videos(
+    roots: list[str],
+    include_dir: list[str] | None = None,
+    exclude_dir: list[str] | None = None,
+) -> list[tuple[str, str, Path]]:
+    """NAS 挂载点发现（与 06/06b 语义一致）：返回 [(share, relpath, path)]。
+
+    跳过：.fcpbundle 子树、隐藏目录/隐藏路径段、代码依赖与群晖系统目录
+    （PRUNE_DIRNAMES）、非 mp4/mov/m4v 后缀。
+    include/exclude 为 relpath 的子串包含匹配（可重复，与 06 一致）。
+    """
+    include = list(include_dir or [])
+    exclude = list(exclude_dir or [])
+    out: list[tuple[str, str, Path]] = []
+    for root in roots:
+        r = Path(root)
+        if not r.is_dir():
+            print(f"[warn] 根目录不存在跳过: {root}", file=sys.stderr)
+            continue
+        share = share_of(root)
+        for dirpath, dirnames, filenames in os.walk(
+                root, onerror=lambda e: print(
+                    f"[warn] 遍历失败 {e.filename}: {e.strerror}", file=sys.stderr)):
+            dirnames[:] = [
+                d for d in dirnames
+                if not d.endswith(".fcpbundle") and not d.startswith(".")
+                and d.lower() not in PRUNE_DIRNAMES
+            ]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                p = Path(dirpath) / fn
+                if p.suffix.lower() not in VIDEO_EXTS:
+                    continue
+                try:
+                    rel = p.relative_to(r).as_posix()
+                except ValueError:
+                    continue
+                if any(seg.startswith(".") for seg in rel.split("/")):
+                    continue
+                if include and not any(s in rel for s in include):
+                    continue
+                if exclude and any(s in rel for s in exclude):
+                    continue
+                out.append((share, rel, p))
+    return out
+
+
 def build_chroma_transcript_entry(
     video_key: str,
     video_id: str,
@@ -233,6 +333,11 @@ def main():
     parser.add_argument("--collection", default=DEFAULT_COLLECTION, help="Chroma collection 集合名")
     parser.add_argument("--scratch-dir", default=DEFAULT_SCRATCH_DIR, help="抽取音频暂存目录")
     parser.add_argument("--videos-dir", help="指定单独处理的本地视频目录（如 videos_sample）")
+    parser.add_argument("--roots", nargs="*", help="NAS 挂载点（默认取 site.json 的 shares）")
+    parser.add_argument("--include-dir", action="append", default=[],
+                        help="仅处理 relpath 含该子串的视频（可重复，语义同 06）")
+    parser.add_argument("--exclude-dir", action="append", default=[],
+                        help="跳过 relpath 含该子串的视频（可重复，语义同 06）")
     parser.add_argument("--limit", type=int, default=0, help="处理视频数量限制（0 为不限）")
     parser.add_argument("--dry-run", action="store_true", help="干跑，仅探测统计不写盘")
     parser.add_argument("--language", default="zh", help="ASR 目标语种（默认 zh）")
@@ -249,25 +354,11 @@ def main():
             print(f"[warn] 读取 state 失败，将新建: {e}")
 
     # 收集待处理视频
-    video_list: list[tuple[str, str, Path]] = []
     if args.videos_dir:
-        vdir = Path(args.videos_dir)
-        for p in vdir.rglob("*"):
-            if p.suffix.lower() in VIDEO_EXTS and not p.name.startswith("."):
-                rel = str(p.relative_to(vdir))
-                video_list.append(("local", rel, p))
+        video_list = discover_local_videos(Path(args.videos_dir))
     else:
-        # 从 site.json 读取挂载点
-        from scripts.site_config import get_shares
-        shares = get_shares()
-        for sh in shares:
-            mpath = Path(sh.mount)
-            if not mpath.exists():
-                continue
-            for p in mpath.rglob("*"):
-                if p.suffix.lower() in VIDEO_EXTS and not p.name.startswith("."):
-                    rel = str(p.relative_to(mpath))
-                    video_list.append((sh.name, rel, p))
+        roots = list(args.roots) if args.roots else _default_roots()
+        video_list = discover_nas_videos(roots, args.include_dir, args.exclude_dir)
 
     print(f"[plan] 扫描到视频总数: {len(video_list)}")
     todo_list = []

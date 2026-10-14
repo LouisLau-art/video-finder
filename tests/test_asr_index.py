@@ -155,3 +155,60 @@ def test_transcriber_transcribe_mock(tmp_path):
     assert res[1]["start"] == 4.0
     assert res[1]["end"] == 7.0
     assert res[1]["time_formatted"] == "00:04"
+
+
+# ---------- 8. 发现范围与剪枝（与 06/06b 语义一致）----------
+
+def test_discover_nas_videos_prunes_and_filters(tmp_path):
+    """NAS 分支：剪枝 FCP/隐藏/依赖目录，后缀与 include/exclude 语义与 06 一致。"""
+    root = tmp_path / "mnt"
+    keep = root / "0视频" / "产品"
+    keep.mkdir(parents=True)
+    (keep / "keep.mp4").write_bytes(b"x")
+    (keep / "upper.MP4").write_bytes(b"x")  # 后缀大小写不敏感
+    (keep / "skip.mkv").write_bytes(b"x")   # 非 06 后缀，不转写
+    (keep / ".hidden.mp4").write_bytes(b"x")
+    fcp = root / "0视频" / "bundle.fcpbundle"
+    fcp.mkdir()
+    (fcp / "inner.mp4").write_bytes(b"x")
+    deps = root / "0视频" / "node_modules"
+    deps.mkdir()
+    (deps / "dep.mp4").write_bytes(b"x")
+    hidden_dir = root / "0视频" / ".cache"
+    hidden_dir.mkdir()
+    (hidden_dir / "hidden.mp4").write_bytes(b"x")
+    exclude_me = root / "0视频" / "旧素材"
+    exclude_me.mkdir()
+    (exclude_me / "old.mp4").write_bytes(b"x")
+
+    found = asr_mod.discover_nas_videos([str(root)])
+    rels = sorted(rel for _share, rel, _p in found)
+    assert rels == [
+        "0视频/产品/keep.mp4",
+        "0视频/产品/upper.MP4",
+        "0视频/旧素材/old.mp4",  # 未传 exclude 时正常发现
+    ]
+    assert all(share == "mnt" for share, _rel, _p in found)  # 未配置映射时回退 basename
+
+    filtered = asr_mod.discover_nas_videos(
+        [str(root)], include_dir=["产品"], exclude_dir=["旧素材"])
+    frels = sorted(rel for _s, rel, _p in filtered)
+    assert frels == ["0视频/产品/keep.mp4", "0视频/产品/upper.MP4"]
+
+    none_found = asr_mod.discover_nas_videos([str(root)], include_dir=["不存在目录"])
+    assert none_found == []
+
+
+def test_discover_local_videos(tmp_path):
+    """本地分支：返回 share='local'，跳过隐藏与非视频文件。"""
+    (tmp_path / "a.mp4").write_bytes(b"x")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "b.mov").write_bytes(b"x")
+    (tmp_path / "sub" / "c.txt").write_text("x")
+    (tmp_path / ".d.mp4").write_bytes(b"x")
+
+    found = asr_mod.discover_local_videos(tmp_path)
+    assert [(share, rel) for share, rel, _p in found] == [
+        ("local", "a.mp4"),
+        ("local", "sub/b.mov"),
+    ]

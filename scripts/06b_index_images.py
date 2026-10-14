@@ -39,6 +39,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -373,6 +379,7 @@ def run_processing(items: list, encoder=None, collection=None, process_one=None,
     workers = max(int(workers), 1)
     processed = done = failed = 0
     consecutive = 0
+    consecutive_nas_fails = 0
     fused = stopped = False
     results: list[dict] = []
     saved_n = 0  # 已回调给 save 的结果数（增量切片，避免全量重放）
@@ -437,11 +444,18 @@ def run_processing(items: list, encoder=None, collection=None, process_one=None,
             processed += 1
             if not res.get("ok"):
                 failed += 1
+                err_msg = str(res.get("error", "unknown"))
+                results.append({"image_key": key, "ok": False, "error": err_msg})
+                # 单个图片文件损坏/无法识别不应视作 NAS 掉线，不计入 NAS 掉线熔断；其余异常均计入
+                is_corrupt_image = any(sig in err_msg for sig in (
+                    "UnidentifiedImageError", "cannot identify image file",
+                    "DecompressionBombError", "truncated",
+                ))
+                if not is_corrupt_image:
+                    consecutive_nas_fails += 1
                 consecutive += 1
-                results.append({"image_key": key, "ok": False,
-                                "error": res.get("error", "unknown")})
-                if consecutive >= max_fail:
-                    print(f"[FUSE] 连续 {consecutive} 张图片处理失败，"
+                if consecutive_nas_fails >= max_fail or consecutive >= max_fail * 5:
+                    print(f"[FUSE] 连续失败达到阈值（连续系统/存储错误={consecutive_nas_fails}，连续总失败={consecutive}），"
                           "疑似 NAS 掉线或后端存储不可用，已中止处理。",
                           file=sys.stderr, flush=True)
                     print(f"[FUSE] state 保持已写盘内容（done={done} failed={failed}），"
@@ -452,6 +466,7 @@ def run_processing(items: list, encoder=None, collection=None, process_one=None,
                     break
                 continue
             consecutive = 0
+            consecutive_nas_fails = 0
             img = res.get("img")
             meta = res.get("meta")
             if img is not None and meta is not None:

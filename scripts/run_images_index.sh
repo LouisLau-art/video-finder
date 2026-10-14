@@ -10,6 +10,8 @@ mkdir -p data/logs
 echo "[run_images_index] 启动，日志: $LOG" | tee -a "$LOG"
 echo "[run_images_index] 范围: 0摄影图（两共享），幂等" | tee -a "$LOG"
 
+export HF_HUB_OFFLINE=1
+
 .venv/bin/python scripts/06b_index_images.py \
   --include-dir "0摄影图" \
   --workers 2 \

@@ -1016,13 +1016,20 @@ def search_by_embedding(
     arr = np.asarray(vec, dtype=np.float32).reshape(1, -1)
 
     requested_k = max(1, int(k_want))
+    # 懒加载分页取数窗口：offset 翻页时需要多取候选才能切片到位。
+    # 无分页（offset=0）时 fetch_k == requested_k，行为与旧版逐位一致。
+    fetch_k = min(100, requested_k * 2)
     try:
         collection_count = max(1, int(col.count()))
     except Exception:
         collection_count = max(1, int(_CHROMA_COUNT))
+    # 候选扩展逻辑以"期望返回条数"（requested_k）定目标；fetch_k 放大
+    # 只影响首查 n_results，避免 offset 翻页触发多余的扩展查询。
     target_k = min(requested_k, collection_count)
 
     # 常见查询只需一次过取；候选不足时按倍数扩展，避免全库捞取。
+    # 懒加载分页：fetch_k > requested_k 时，首查取大窗口但仍以 requested_k 为目标，
+    # 保证常见路径（如 top_k=3/offset=0）保持单次查询行为不变。
     if VIDEO_LEVEL_CANDIDATE_EXPANSION_ENABLED:
         n_results = min(
             collection_count,
@@ -1033,7 +1040,7 @@ def search_by_embedding(
         )
     else:
         # 关闭扩展时保留单次 top_k 帧查询行为，聚合逻辑本身不变。
-        n_results = target_k
+        n_results = requested_k
     n_results = max(1, int(n_results))
 
     expansion_started = time.perf_counter()
@@ -1208,6 +1215,8 @@ class SearchRequest(BaseModel):
     top_k: int = Field(default=20, ge=1, le=100, description="返回前 K 个素材")
     # 兼容 topk 别名写法
     topk: int | None = Field(default=None, ge=1, le=100, exclude=True)
+    # 懒加载分页：从全部候选结果的第 offset 条开始切片（0 起始）
+    offset: int = Field(default=0, ge=0, le=10000, description="结果偏移量（翻页用）")
 
 
 class FeedbackRequest(BaseModel):
@@ -1307,6 +1316,13 @@ def search(req: SearchRequest) -> dict[str, Any]:
     )
     q_emb = encoder.encode_texts([resolved])
     out = search_by_embedding(q_emb[0], k_want, q, keyword_query=q)
+    results = out.get("data", {}).get("results", [])
+    window, has_more = paginate_results(results, req.offset, k_want)
+    out["data"]["results"] = window
+    out["data"]["total"] = len(window)  # 语义恢复为"本页条数"（契约：total=results 长度）
+    out["data"]["offset"] = req.offset
+    out["data"]["has_more"] = has_more
+    out["data"]["total_fetched"] = len(results)
     out["data"]["elapsed_ms"] = int((time.perf_counter() - t_start) * 1000)
     return out
 
@@ -1316,6 +1332,15 @@ def _clamp_top_k(v: Any, default: int) -> int:
         return max(1, min(int(v), 100))
     except (TypeError, ValueError):
         return default
+
+
+def paginate_results(
+    results: list[dict[str, Any]], offset: int, k_want: int
+) -> tuple[list[dict[str, Any]], bool]:
+    """结果切片：返回 (窗口内结果, 是否还有更多)。offset 越界时返回空列表。"""
+    window = results[offset : offset + k_want]
+    has_more = len(results) > offset + k_want
+    return window, has_more
 
 
 @app.post("/api/search-by-image")

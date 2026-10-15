@@ -1150,7 +1150,7 @@ def search_by_embedding(
         fused_ids = reciprocal_rank_fusion(*rankings, k=RRF_K, weights=tuple(weights))
 
         fused_results: list[dict[str, Any]] = []
-        for rank, identity in enumerate(fused_ids[:requested_k], 1):
+        for rank, identity in enumerate(fused_ids[:fetch_k], 1):
             semantic_row = semantic_by_identity.get(identity)
             keyword_text = keyword_text_by_id.get(identity)
             transcript_meta = transcript_meta_by_id.get(identity)

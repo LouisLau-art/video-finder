@@ -66,6 +66,7 @@ TS="$(date +%Y%m%d)"
 LOG_FILE="data/logs/nightly_${TS}.log"
 IMAGE_LOG_FILE="data/logs/nightly_images_${TS}.log"
 ASR_LOG_FILE="data/logs/nightly_asr_${TS}.log"
+GC_LOG_FILE="data/logs/nightly_gc_${TS}.log"
 STATUS_FILE="data/ops/nightly_status.json"
 
 mkdir -p data/logs data/ops
@@ -218,6 +219,24 @@ if [ -z "$IMAGE_NEW" ]; then
 fi
 INDEXED_IMAGES_NEW="$IMAGE_NEW"
 log "步骤3b完成: 图片待处理 = ${INDEXED_IMAGES_NEW:-统计失败(将记为 null)}"
+
+# ---- 3b2. 图片删除下架 GC（30 天缓冲；非阻断）----
+# 06d：NAS 已删图片先标记 deleted_pending（结果不可见），满 30 天才真删。
+# 失败不拦主链路：GC 异常时索引/发布仍应照常完成。
+log "步骤3b2: 图片删除下架 GC（30 天缓冲，dry-run 预检）..."
+GC_RC=0
+timeout 2h .venv/bin/python scripts/06d_gc_images.py --dry-run 2>&1 | tee "$GC_LOG_FILE" || GC_RC=$?
+if [ "$GC_RC" -ne 0 ]; then
+    log "[nightly][warn] 图片 GC dry-run 失败（退出码 $GC_RC，日志: $GC_LOG_FILE）"
+else
+    timeout 2h .venv/bin/python scripts/06d_gc_images.py 2>&1 | tee -a "$GC_LOG_FILE" || GC_RC=$?
+    if [ "$GC_RC" -ne 0 ]; then
+        log "[nightly][warn] 图片 GC 失败（退出码 $GC_RC，日志: $GC_LOG_FILE）"
+    fi
+fi
+GC_MARKED="$(grep -oE '新标记下架=[0-9]+' "$GC_LOG_FILE" | tail -1 | cut -d= -f2)"
+GC_PURGED="$(grep -oE '真删=[0-9]+' "$GC_LOG_FILE" | tail -1 | cut -d= -f2)"
+log "步骤3b2完成: 新标记下架=${GC_MARKED:-0} 真删=${GC_PURGED:-0}"
 
 # ---- 3c. ASR 台词转写（限时 4h；幂等断点续跑；非阻断）----
 # 台词集合（transcripts）与帧/图片集合同库，随步骤4的 --index 一并发布。

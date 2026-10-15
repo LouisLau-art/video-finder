@@ -206,6 +206,13 @@ _KEYWORD_INDEX: dict[str, dict[str, Any]] | None = None
 _KEYWORD_INDEX_COUNT: int | None = None
 _KEYWORD_INDEX_LAST_REFRESH_AT: float | None = None
 
+# 图片删除下架集合（ticket-04-part2）：state_images.json 中 deleted_pending
+# （缓冲期内）的 image_key 不出现在搜索结果里。集合懒加载 + 节流刷新，
+# 与关键词索引同模式；state 文件缺失/损坏时为空集合（不影响检索）。
+_DELETED_IMAGE_KEYS: set[str] = set()
+_DELETED_KEYS_LAST_REFRESH_AT: float | None = None
+_DELETED_KEYS_MTIME: float | None = None
+
 # 元数据 path 字段推导出的额外帧/原图目录（find_frame_file 兜底候选，
 # 随关键词索引刷新而更新；固定候选 APP_FRAMES_DIRS 永远优先）。
 _EXTRA_FRAME_DIRS: list[str] = []
@@ -1317,6 +1324,9 @@ def search(req: SearchRequest) -> dict[str, Any]:
     q_emb = encoder.encode_texts([resolved])
     out = search_by_embedding(q_emb[0], k_want, q, keyword_query=q)
     results = out.get("data", {}).get("results", [])
+    # 图片删除下架过滤（ticket-04-part2）：deleted_pending 缓冲期内的图片行剔除，
+    # rank 重排后再分页。集合为空（未跑 GC / state 缺失）时逐位不走过滤。
+    results = filter_deleted_rows(results, ensure_deleted_image_keys())
     window, has_more = paginate_results(results, req.offset, k_want)
     out["data"]["results"] = window
     out["data"]["total"] = len(window)  # 语义恢复为"本页条数"（契约：total=results 长度）
@@ -1332,6 +1342,82 @@ def _clamp_top_k(v: Any, default: int) -> int:
         return max(1, min(int(v), 100))
     except (TypeError, ValueError):
         return default
+
+
+def load_deleted_image_keys(state_path: Path | str) -> set[str]:
+    """读 state_images.json，返回 deleted_pending（缓冲期内下架）的 image_key 集合。
+
+    文件不存在/损坏返回空集合：GC 从未跑过或 state 异常时，检索行为与旧版一致。
+    """
+    p = Path(state_path)
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 — state 损坏不能让检索挂掉
+        print(f"[api] 图片 state 读取失败（下架过滤跳过）: {e}")
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    return {
+        str(k) for k, v in data.items()
+        if isinstance(v, dict) and v.get("status") == "deleted_pending"
+    }
+
+
+def _deleted_image_keys_refresh_interval() -> int:
+    return _env_int("VIDEO_FINDER_DELETED_REFRESH_SEC", 60, 1)
+
+
+def ensure_deleted_image_keys() -> set[str]:
+    """下架集合懒加载 + 节流刷新（与 ensure_keyword_index 同模式）。
+
+    state 文件 mtime 变化（GC 刚跑过）时立即刷新，否则至少 60s 轮询一次。
+    """
+    global _DELETED_IMAGE_KEYS, _DELETED_KEYS_LAST_REFRESH_AT, _DELETED_KEYS_MTIME
+    state_path = _images_state_path()
+    if state_path is None:
+        return _DELETED_IMAGE_KEYS
+    try:
+        mtime = state_path.stat().st_mtime
+    except OSError:
+        return _DELETED_IMAGE_KEYS
+    now = time.time()
+    stale = (
+        _DELETED_KEYS_LAST_REFRESH_AT is None
+        or now - _DELETED_KEYS_LAST_REFRESH_AT >= _deleted_image_keys_refresh_interval()
+    )
+    if stale or mtime != _DELETED_KEYS_MTIME:
+        _DELETED_IMAGE_KEYS = load_deleted_image_keys(state_path)
+        _DELETED_KEYS_LAST_REFRESH_AT = now
+        _DELETED_KEYS_MTIME = mtime
+    return _DELETED_IMAGE_KEYS
+
+
+def filter_deleted_rows(rows: list[dict[str, Any]],
+                        deleted_keys: set[str]) -> list[dict[str, Any]]:
+    """剔除下架图片行；rank 重排连续。集合为空时原样返回（逐位一致）。"""
+    if not deleted_keys:
+        return rows
+    kept = [
+        r for r in rows
+        if not (str(r.get("media_type")) == "image"
+                and str(r.get("image_key") or "") in deleted_keys)
+    ]
+    if len(kept) == len(rows):
+        return rows
+    for rank, r in enumerate(kept, 1):
+        r["rank"] = rank  # 原地改 rank 保持对象身份（调用方可能持有引用）
+    return kept
+
+
+def _images_state_path() -> Path | None:
+    """state_images.json 路径：与 APP_DB 同级的 index_full/ 下（部署形态一致）。"""
+    if not APP_DB:
+        return None
+    # APP_DB = <base>/index_full/cnclip；state 在 <base>/index_full/ 下
+    p = Path(APP_DB).parent / "state_images.json"
+    return p
 
 
 def paginate_results(

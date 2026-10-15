@@ -7,6 +7,7 @@
     POST /api/search          文本搜素材（视频级结果）(请求体见 SearchRequest)
     POST /api/search-by-image 以图搜素材（multipart 表单: image 文件 + 可选 query/top_k；
                               或 JSON: {image_base64, query?, top_k?})
+    POST /api/feedback        意见收集（搜索词/结果/原因/描述 append 到 JSONL）
     GET  /api/frames/{name}   帧图片静态预览 (流式返回 jpg)
     GET  /api/health          健康检查 {"status": "ok", "frames_count": N}
 
@@ -40,6 +41,7 @@ import os
 import re
 import time
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -70,6 +72,17 @@ DEFAULT_FRAMES_CANDIDATES = [
     "data/local-runtime/brand2_frames",
     "frames",
 ]
+
+# 意见收集（/api/feedback）落盘路径：JSONL append。
+# 生产环境用 VF_FEEDBACK_PATH 指向部署目录之外（rsync 代码同步不会误删）；
+# 本地/测试默认 data/feedback/feedback.jsonl。
+FEEDBACK_PATH = Path(
+    os.environ.get("VF_FEEDBACK_PATH") or (ROOT / "data" / "feedback" / "feedback.jsonl")
+)
+FEEDBACK_REASONS = ("wrong_result", "missing_asset", "other")
+_FEEDBACK_MAX_QUERY = 200
+_FEEDBACK_MAX_RESULT_ID = 200
+_FEEDBACK_MAX_DETAIL = 2000
 
 # 站点私有配置（NAS 前缀/映射表等）全部来自仓库外的 site.json，
 # 缺失则给空值/空 map（降级运行，不影响本地最小链路）。
@@ -1197,6 +1210,55 @@ class SearchRequest(BaseModel):
     topk: int | None = Field(default=None, ge=1, le=100, exclude=True)
 
 
+class FeedbackRequest(BaseModel):
+    """POST /api/feedback 请求体（意见收集）。
+
+    全部字段容错：缺失/超长/非法 reason 都会被规范化而不是报错
+    （见 normalize_feedback）。前端可能额外带字段：extra=ignore 丢弃。
+    """
+
+    model_config = {"extra": "ignore"}
+
+    query: str = Field(default="", description="当时的搜索词（可为空）")
+    result_id: str = Field(
+        default="", description="被反馈结果的素材身份（video_key/image_key，可空）"
+    )
+    reason: str = Field(
+        default="other", description="wrong_result | missing_asset | other"
+    )
+    detail: str = Field(default="", description="用户补充描述（可为空）")
+
+
+def _clip_feedback_text(value: Any, limit: int) -> str:
+    """转字符串、去首尾空白、按上限截断（防御式，不抛错）。"""
+    text = "" if value is None else str(value)
+    return text.strip()[:limit]
+
+
+def normalize_feedback(body: FeedbackRequest) -> dict[str, Any]:
+    """规范化反馈记录：截断超长、归一化 reason、补北京时间戳。"""
+    reason = _clip_feedback_text(body.reason, 32).lower()
+    if reason not in FEEDBACK_REASONS:
+        reason = "other"
+    return {
+        "ts": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
+        "query": _clip_feedback_text(body.query, _FEEDBACK_MAX_QUERY),
+        "result_id": _clip_feedback_text(body.result_id, _FEEDBACK_MAX_RESULT_ID),
+        "reason": reason,
+        "detail": _clip_feedback_text(body.detail, _FEEDBACK_MAX_DETAIL),
+    }
+
+
+def write_feedback(record: dict[str, Any], path: Path | None = None) -> Path:
+    """把一条反馈 append 到 JSONL（自动建父目录）；返回实际写入路径。"""
+    target = Path(path) if path is not None else FEEDBACK_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False)
+    with target.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    return target
+
+
 app = FastAPI(title="视频检索 API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -1350,6 +1412,25 @@ async def search_by_image(request: Request) -> dict[str, Any]:
     out = search_by_embedding(img_emb[0], k_want, label)
     out["data"]["elapsed_ms"] = int((time.perf_counter() - t_start) * 1000)
     return out
+
+
+@app.post("/api/feedback")
+def feedback(req: FeedbackRequest) -> dict[str, Any]:
+    """意见收集：把用户反馈（搜索词/结果/原因/描述）append 到 JSONL。
+
+    字段问题一律规范化（截断/归一）而非 400；仅落盘失败返回 500。
+    """
+    record = normalize_feedback(req)
+    try:
+        write_feedback(record)
+    except OSError as e:
+        print(f"[api][error] 反馈落盘失败: {e}")
+        raise HTTPException(status_code=500, detail="反馈落盘失败，请稍后重试")
+    print(
+        f"[api] feedback: reason={record['reason']} "
+        f"query={record['query'][:50]!r} result_id={record['result_id'][:40]!r}"
+    )
+    return {"code": 0, "message": "ok"}
 
 
 def main() -> int:

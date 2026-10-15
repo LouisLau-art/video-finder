@@ -115,3 +115,43 @@ def test_feedback_write_failure_returns_500(api_client, monkeypatch):
     resp = client.post("/api/feedback", json={"query": "x", "reason": "other"})
     assert resp.status_code == 500
     assert "反馈落盘失败" in resp.json()["detail"]
+
+# ---------- 中文 reason 兼容映射（前端契约用中文枚举） ----------
+
+def test_normalize_maps_chinese_reason():
+    """前端提交中文 reason（结果不准/缺少素材/功能建议）映射为英文枚举。"""
+    import importlib.util
+    from pathlib import Path
+    repo = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "api_05_fb", repo / "scripts" / "05_api.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    body = m.FeedbackRequest(query="跑步", reason="结果不准",
+                             result_id="k1", comment="画面不符")
+    rec = m.normalize_feedback(body)
+    assert rec["reason"] == "wrong_result"
+    assert rec["detail"] == "画面不符"   # comment 别名回退到 detail
+
+    body2 = m.FeedbackRequest(query="跑步", reason="缺少素材",
+                              detail="找不到肯尼亚那批")
+    assert m.normalize_feedback(body2)["reason"] == "missing_asset"
+    assert m.normalize_feedback(body2)["detail"] == "找不到肯尼亚那批"
+
+    body3 = m.FeedbackRequest(query="跑步", reason="功能建议")
+    assert m.normalize_feedback(body3)["reason"] == "other"
+
+
+def test_normalize_english_reason_still_works():
+    """英文枚举与非法值行为不变（向后兼容）。"""
+    import importlib.util
+    from pathlib import Path
+    repo = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "api_05_fb2", repo / "scripts" / "05_api.py")
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    assert m.normalize_feedback(
+        m.FeedbackRequest(reason="wrong_result"))["reason"] == "wrong_result"
+    assert m.normalize_feedback(
+        m.FeedbackRequest(reason="乱写的"))["reason"] == "other"

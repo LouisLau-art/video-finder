@@ -80,6 +80,15 @@ FEEDBACK_PATH = Path(
     os.environ.get("VF_FEEDBACK_PATH") or (ROOT / "data" / "feedback" / "feedback.jsonl")
 )
 FEEDBACK_REASONS = ("wrong_result", "missing_asset", "other")
+
+# 中文 reason 兼容映射：前端契约（issues/frontend-prompt-feedback.md）用中文
+# 枚举提交，后端归一化到英文枚举落盘。大小写/空白/别称都容忍。
+FEEDBACK_REASON_ZH = {
+    "结果不准": "wrong_result",
+    "缺少素材": "missing_asset",
+    "功能建议": "other",
+    "其他": "other",
+}
 _FEEDBACK_MAX_QUERY = 200
 _FEEDBACK_MAX_RESULT_ID = 200
 _FEEDBACK_MAX_DETAIL = 2000
@@ -1235,14 +1244,15 @@ class FeedbackRequest(BaseModel):
 
     model_config = {"extra": "ignore"}
 
-    query: str = Field(default="", description="当时的搜索词（可为空）")
-    result_id: str = Field(
-        default="", description="被反馈结果的素材身份（video_key/image_key，可空）"
-    )
+    query: str = Field(default="", description="用户当时的搜索词")
     reason: str = Field(
-        default="other", description="wrong_result | missing_asset | other"
+        default="other",
+        description="wrong_result | missing_asset | other（中文枚举亦兼容映射）",
     )
     detail: str = Field(default="", description="用户补充描述（可为空）")
+    result_id: str = Field(default="", description="被反馈结果的素材身份")
+    # 前端契约别名：前端文档用 comment 承载用户描述，落盘统一到 detail
+    comment: str | None = Field(default=None, exclude=True)
 
 
 def _clip_feedback_text(value: Any, limit: int) -> str:
@@ -1253,15 +1263,23 @@ def _clip_feedback_text(value: Any, limit: int) -> str:
 
 def normalize_feedback(body: FeedbackRequest) -> dict[str, Any]:
     """规范化反馈记录：截断超长、归一化 reason、补北京时间戳。"""
-    reason = _clip_feedback_text(body.reason, 32).lower()
+    raw_reason = _clip_feedback_text(body.reason, 32)
+    reason = raw_reason.lower()
+    if reason in FEEDBACK_REASON_ZH:          # 中文原文直接命中
+        reason = FEEDBACK_REASON_ZH[reason]
+    elif raw_reason in FEEDBACK_REASON_ZH:    # 中文（lower 不改汉字，双保险）
+        reason = FEEDBACK_REASON_ZH[raw_reason]
     if reason not in FEEDBACK_REASONS:
         reason = "other"
+    # comment 是前端契约别名：detail 为空时回退到 comment
+    detail = _clip_feedback_text(
+        body.detail or body.comment or "", _FEEDBACK_MAX_DETAIL)
     return {
         "ts": datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds"),
         "query": _clip_feedback_text(body.query, _FEEDBACK_MAX_QUERY),
         "result_id": _clip_feedback_text(body.result_id, _FEEDBACK_MAX_RESULT_ID),
         "reason": reason,
-        "detail": _clip_feedback_text(body.detail, _FEEDBACK_MAX_DETAIL),
+        "detail": detail,
     }
 
 

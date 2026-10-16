@@ -256,6 +256,7 @@ def discover_nas_videos(
     include = list(include_dir or [])
     exclude = list(exclude_dir or [])
     out: list[tuple[str, str, Path]] = []
+    scanned_dirs = 0
     for root in roots:
         r = Path(root)
         if not r.is_dir():
@@ -265,6 +266,9 @@ def discover_nas_videos(
         for dirpath, dirnames, filenames in os.walk(
                 root, onerror=lambda e: print(
                     f"[warn] 遍历失败 {e.filename}: {e.strerror}", file=sys.stderr)):
+            scanned_dirs += 1
+            if scanned_dirs % 500 == 0:
+                print(f"[scan] 已扫 {scanned_dirs} 目录，已发现 {len(out)} 视频...", flush=True)
             dirnames[:] = [
                 d for d in dirnames
                 if not d.endswith(".fcpbundle") and not d.startswith(".")

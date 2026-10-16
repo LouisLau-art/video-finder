@@ -356,10 +356,17 @@ def _extract_job(job: dict) -> dict:
                     local_copy.unlink(missing_ok=True)
                 local_copy = None
 
-        # 复用 01_extract.process_video（不改它）：先落 staging，避免同名 stem 并行相撞
-        raw_rows = m01.process_video(
-            local_copy if local_copy is not None else src,
-            staging, job["fps"], job["max_per_scene"])
+        # 复用 01_extract.process_video：先落 staging，避免同名 stem 并行相撞
+        # 向后兼容：若模块接受 max_width 则传入，否则回退 4 参数调用
+        try:
+            raw_rows = m01.process_video(
+                local_copy if local_copy is not None else src,
+                staging, job["fps"], job["max_per_scene"],
+                max_width=int(job.get("max_frame_width", 1280)))
+        except TypeError:
+            raw_rows = m01.process_video(
+                local_copy if local_copy is not None else src,
+                staging, job["fps"], job["max_per_scene"])
         rows: list[dict] = []
         for r in raw_rows:
             t = float(r["time"])
@@ -520,8 +527,11 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=64, help="每批 encode+upsert 帧数")
     ap.add_argument("--fps", type=float, default=1.0, help="回退模式帧率（透传 01）")
     ap.add_argument("--max-per-scene", type=int, default=3, help="每场景最多帧数（透传 01）")
+    ap.add_argument("--max-frame-width", type=int, default=1280,
+                    help="抽帧最大宽度（默认 1280，等比缩放防 4K 巨帧撑爆磁盘；0 表示不限宽）")
     args = ap.parse_args()
     args.batch_size = max(int(args.batch_size), 1)
+    args.max_frame_width = max(int(args.max_frame_width), 0)
     args.memory_limit_mb = max(int(args.memory_limit_mb), 0)
     args.scratch_min_free_gb = max(float(args.scratch_min_free_gb), 0.0)
 
@@ -696,6 +706,7 @@ def main() -> int:
              "frames_dir": str(frames_dir),
              "local_scratch": local_scratch,
              "scratch_min_free_bytes": int(args.scratch_min_free_gb * (1024 ** 3)),
+             "max_frame_width": int(args.max_frame_width),
              "fps": args.fps, "max_per_scene": args.max_per_scene} for v in todo]
     by_key = {v["video_key"]: v for v in todo}
 

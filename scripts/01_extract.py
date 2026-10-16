@@ -49,18 +49,34 @@ def get_duration(video: Path) -> float | None:
         return None
 
 
-def extract_frame(video: Path, t: float, out: Path) -> bool:
-    """在 t 秒处抽 1 帧. -ss 放 -i 前面, 速度快, 精度对原型足够."""
+DEFAULT_MAX_FRAME_WIDTH = 1280
+
+
+def extract_frame(
+    video: Path,
+    t: float,
+    out: Path,
+    max_width: int = DEFAULT_MAX_FRAME_WIDTH,
+) -> bool:
+    """在 t 秒处抽 1 帧. -ss 放 -i 前面, 速度快, 精度对原型足够.
+    默认限宽 1280，保持比例缩放，避免 4K 巨帧撑爆磁盘。
+    """
     out.parent.mkdir(parents=True, exist_ok=True)
-    p = run([
+    cmd = [
         "ffmpeg", "-y", "-v", "error",
         "-ss", f"{max(t, 0):.2f}",
         "-i", str(video),
         "-frames:v", "1",
+        "-strict", "-1",
+    ]
+    if max_width and max_width > 0:
+        cmd.extend(["-vf", f"scale='min({max_width},iw)':-2"])
+    cmd.extend([
         "-q:v", "2",
         str(out),
     ])
-    return out.exists() and out.stat().st_size > 0
+    p = run(cmd)
+    return p.returncode == 0 and out.exists() and out.stat().st_size > 0
 
 
 def detect_scenes(video: Path) -> list[tuple[float, float]] | None:
@@ -137,7 +153,13 @@ def is_blank_frame(
     return mean < mean_threshold or std < std_threshold
 
 
-def process_video(video: Path, frames_dir: Path, fps: float, max_per_scene: int) -> list[dict]:
+def process_video(
+    video: Path,
+    frames_dir: Path,
+    fps: float,
+    max_per_scene: int,
+    max_width: int = DEFAULT_MAX_FRAME_WIDTH,
+) -> list[dict]:
     video_id = video.stem
     duration = get_duration(video)
     print(f"[video] {video.name} duration={duration}")
@@ -158,7 +180,7 @@ def process_video(video: Path, frames_dir: Path, fps: float, max_per_scene: int)
     for t in ts:
         fname = f"{video_id}_{t:.1f}.jpg"
         out = frames_dir / fname
-        ok = extract_frame(video, t, out)
+        ok = extract_frame(video, t, out, max_width=max_width)
         if not ok:
             print(f"[warn] 抽帧失败: {video.name} @ {t}s", file=sys.stderr)
             continue

@@ -16,6 +16,8 @@ mkdir -p "$LOG_DIR"
 TS="$(date +%Y%m%d_%H%M%S)"
 MAIN_LOG="$LOG_DIR/chain_skipped_asr_${TS}.log"
 
+export HF_HUB_OFFLINE=1
+
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] === 启动串行任务流水线 ===" | tee -a "$MAIN_LOG"
 
 # 阶段一：补录 30 个 skipped 4K 视频（限宽 1280 抽帧）

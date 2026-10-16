@@ -105,8 +105,12 @@ class CnClipEncoder:
         import torch
         from transformers import ChineseCLIPModel, ChineseCLIPProcessor
         self.torch = torch
-        self.processor = ChineseCLIPProcessor.from_pretrained(self.model_id)
-        self.model = ChineseCLIPModel.from_pretrained(self.model_id)
+        try:
+            self.processor = ChineseCLIPProcessor.from_pretrained(self.model_id, local_files_only=True)
+            self.model = ChineseCLIPModel.from_pretrained(self.model_id, local_files_only=True)
+        except Exception:
+            self.processor = ChineseCLIPProcessor.from_pretrained(self.model_id)
+            self.model = ChineseCLIPModel.from_pretrained(self.model_id)
         self.model.eval()
         self.dim = int(getattr(self.model.config, "projection_dim", 512) or 512)
         print(f"[encoder] CN-CLIP loaded: {self.model_id}, dim={self.dim}")

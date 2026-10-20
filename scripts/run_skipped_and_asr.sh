@@ -20,14 +20,14 @@ export HF_HUB_OFFLINE=1
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] === 启动串行任务流水线 ===" | tee -a "$MAIN_LOG"
 
-# 阶段一：补录 30 个 skipped 4K 视频（限宽 1280 抽帧）
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] [阶段一] 开始补录 30 个 skipped 视频..." | tee -a "$MAIN_LOG"
-.venv/bin/python scripts/06_index_all.py --only-skipped --max-frame-width 1280 2>&1 | tee -a "$MAIN_LOG"
+# 阶段一：补录 30 个 skipped 4K 视频（单 Worker + 限宽 1280 抽帧，闲时优先级不卡桌面）
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] [阶段一] 开始补录 30 个 skipped 视频(单worker闲时调度)..." | tee -a "$MAIN_LOG"
+nice -n 19 ionice -c 3 .venv/bin/python scripts/06_index_all.py --only-skipped --max-frame-width 1280 --workers 1 2>&1 | tee -a "$MAIN_LOG"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [阶段一] 30 个 skipped 视频处理完毕！" | tee -a "$MAIN_LOG"
 
-# 阶段二：全量 ASR 语音台词提取
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] [阶段二] 开始全量 ASR 语音台词提取..." | tee -a "$MAIN_LOG"
-.venv/bin/python scripts/06c_index_asr.py 2>&1 | tee -a "$MAIN_LOG"
+# 阶段二：全量 ASR 语音台词提取（闲时优先级）
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] [阶段二] 开始全量 ASR 语音台词提取(闲时调度)..." | tee -a "$MAIN_LOG"
+nice -n 19 ionice -c 3 .venv/bin/python scripts/06c_index_asr.py 2>&1 | tee -a "$MAIN_LOG"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [阶段二] 全量 ASR 提取完毕！" | tee -a "$MAIN_LOG"
 
 # 阶段三：同步发布到新服务器

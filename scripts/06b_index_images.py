@@ -543,9 +543,10 @@ def save_state(state_path: Path, state: dict) -> None:
 
 
 def plan_pending(items: list[dict], state: dict, force: bool = False) -> list[dict]:
-    """按 state 过滤出待处理项：done 且 mtime/size 均未变化才跳过。
+    """按 state 过滤出待处理项：done 或 skipped 且 mtime/size 均未变化才跳过。
 
-    failed 不阻断（可重试）；mtime 或 size 任一变化即重处理（幂等增量）；
+    failed 不阻断（可重试）；skipped（如已知损坏文件）不无休止重试；
+    mtime 或 size 任一变化即重处理（幂等增量）；
     force 时全部重跑。
     """
     todo: list[dict] = []
@@ -553,7 +554,7 @@ def plan_pending(items: list[dict], state: dict, force: bool = False) -> list[di
         key = it.get("image_key") or image_key_of(it["share"], it["relpath"])
         it.setdefault("image_key", key)
         st = state.get(key)
-        if st and not force and st.get("status") == "done" \
+        if st and not force and st.get("status") in ("done", "skipped") \
                 and st.get("mtime") == it["mtime"] and st.get("size") == it["size"]:
             continue
         todo.append(it)

@@ -171,6 +171,12 @@ def test_state_idempotent_skip_and_mtime_change(tmp_path):
     plan = module.plan_pending(found, state, force=False)
     assert sorted(i["image_key"] for i in plan) == sorted([key_old, key_new])
 
+    # skipped 状态（如已知损坏文件）不无休止重试，直接跳过
+    state[key_old] = {"status": "skipped", "mtime": items["old.jpg"]["mtime"],
+                      "size": items["old.jpg"]["size"], "skip_reason": "corrupted"}
+    plan = module.plan_pending(found, state, force=False)
+    assert [i["image_key"] for i in plan] == [key_new]
+
     # force 全部重跑
     state[key_old] = {"status": "done", "mtime": items["old.jpg"]["mtime"],
                       "size": items["old.jpg"]["size"],
